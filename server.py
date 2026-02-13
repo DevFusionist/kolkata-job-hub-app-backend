@@ -131,6 +131,24 @@ def serialize_doc(doc):
         del doc["_id"]
     return doc
 
+    # health check route
+@api_router.get("/health")
+async def health_check():
+    try:
+        # Ping MongoDB
+        await db.command("ping")
+        db_status = "connected"
+    except Exception:
+        db_status = "disconnected"
+
+    return {
+        "status": "healthy" if db_status == "connected" else "degraded",
+        "database": db_status,
+        "service": "kolkata-job-platform",
+        "timestamp": datetime.utcnow()
+    }
+
+
 # Auth endpoints (Mock OTP)
 @api_router.post("/auth/send-otp")
 async def send_otp(request: OTPRequest):
