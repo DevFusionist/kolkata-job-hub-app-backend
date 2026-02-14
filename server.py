@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisco
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import json
 import os
 import logging
 from pathlib import Path
@@ -359,10 +360,19 @@ async def create_message(message: MessageCreate, sender_id: str):
     result = await db.messages.insert_one(msg_dict)
     msg_dict["id"] = str(result.inserted_id)
     
-    # Send via WebSocket if connected
-    await manager.send_message(message.receiverId, msg_dict)
+    # Serialize for JSON (datetime -> ISO string) and send via WebSocket if receiver connected
+    msg_for_ws = {
+        "id": msg_dict["id"],
+        "senderId": msg_dict["senderId"],
+        "receiverId": msg_dict["receiverId"],
+        "message": msg_dict["message"],
+        "jobId": msg_dict.get("jobId", ""),
+        "timestamp": msg_dict["timestamp"].isoformat() + "Z",
+        "read": msg_dict["read"],
+    }
+    await manager.send_message(message.receiverId, {"type": "new_message", "payload": msg_for_ws})
     
-    return msg_dict
+    return {**msg_dict, "timestamp": msg_for_ws["timestamp"]}
 
 @api_router.get("/messages/{user_id}", response_model=List[Message])
 async def get_user_messages(user_id: str, other_user_id: str):
@@ -453,15 +463,23 @@ async def verify_payment(payment: PaymentVerify, employer_id: str):
     
     return {"success": True, "message": "Payment verified"}
 
-# WebSocket endpoint
+# WebSocket endpoint for real-time messaging
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(websocket, user_id)
     try:
         while True:
-            await websocket.receive_json()
-            # Handle incoming messages if needed
+            # Receive (ping/text) to keep connection alive; client can send pings
+            data = await websocket.receive_text()
+            try:
+                obj = json.loads(data)
+                if obj.get("type") == "ping":
+                    await manager.send_message(user_id, {"type": "pong"})
+            except (json.JSONDecodeError, KeyError):
+                pass
     except WebSocketDisconnect:
+        manager.disconnect(user_id)
+    except Exception:
         manager.disconnect(user_id)
 
 app.include_router(api_router)
