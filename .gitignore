@@ -1,24 +1,12 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-.venv/
-env/
-.env/
-*.egg-info/
-.eggs/
-*.egg
-dist/
-build/
-*.manifest
+# Dependencies
+node_modules/
 
-# Environment and secrets
+# Environment (keep .env for local dev; never commit secrets)
 .env
 .env.*
 !.env.example
+
+# Secrets
 *credentials*
 *token*.json
 *.pem
@@ -30,19 +18,6 @@ build/
 *.swo
 *~
 
-# Testing and coverage
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-coverage.xml
-*.cover
-.hypothesis/
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
 # Logs and debug
 *.log
 npm-debug.log*
@@ -53,13 +28,13 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Jupyter
-.ipynb_checkpoints/
-
 # Local / database
 *.db
 *.sqlite3
 dump.rdb
+
+# Temp files (e.g. ai transcribe)
+.tmp/
 
 # Caches
 .cache/
