@@ -1,10 +1,11 @@
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import json
 import os
 import logging
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -60,7 +61,7 @@ class UserCreate(BaseModel):
 
 class User(UserCreate):
     id: str
-    freeJobsRemaining: int = 2
+    freeJobsRemaining: int = 0  # Only employers get 2; set in create_user
     createdAt: datetime = Field(default_factory=datetime.utcnow)
 
 class JobCreate(BaseModel):
@@ -125,11 +126,28 @@ class OTPVerify(BaseModel):
     phone: str
     otp: str
 
-# Helper function to convert ObjectId to string
-def serialize_doc(doc):
-    if doc and "_id" in doc:
+class LoginRequest(BaseModel):
+    phone: str
+    mpin: str  # 4-6 digit PIN
+
+class SetMPINRequest(BaseModel):
+    phone: str
+    mpin: str  # 4-6 digit PIN
+
+def hash_mpin(mpin: str) -> str:
+    salt = os.environ.get("MPIN_SALT", "kolkata-job-hub-mpin-salt")
+    return hashlib.sha256((mpin + salt).encode()).hexdigest()
+
+# Helper function to convert ObjectId to string (exclude sensitive fields from response)
+def serialize_doc(doc, exclude_sensitive=True):
+    if not doc:
+        return doc
+    doc = dict(doc)
+    if "_id" in doc:
         doc["id"] = str(doc["_id"])
         del doc["_id"]
+    if exclude_sensitive:
+        doc.pop("mpinHash", None)
     return doc
 
     # health check route
@@ -150,30 +168,58 @@ async def health_check():
     }
 
 
-# Auth endpoints (Mock OTP)
+# Auth endpoints: OTP only for registration (verify phone); MPIN for login
 @api_router.post("/auth/send-otp")
 async def send_otp(request: OTPRequest):
-    # Mock OTP - in production, use Firebase or MSG91
-    # For testing, always accept OTP: 123456
-    return {"success": True, "message": "OTP sent successfully. Use 123456 for testing"}
+    # Mock OTP - in production, use Firebase or MSG91; use only at registration to verify phone
+    return {"success": True, "message": "OTP sent. Use 123456 for testing."}
 
 @api_router.post("/auth/verify-otp")
 async def verify_otp(request: OTPVerify):
-    # Mock verification - accept any 6-digit OTP or 123456
-    if len(request.otp) == 6:
-        # Check if user exists
-        user = await db.users.find_one({"phone": request.phone})
-        if user:
-            user = serialize_doc(user)
-            return {"success": True, "user": user, "isNewUser": False}
-        return {"success": True, "isNewUser": True}
-    return {"success": False, "message": "Invalid OTP"}
+    # Only for registration flow: verify phone. Accept 6-digit OTP (mock: 123456).
+    if len(request.otp) != 6:
+        return {"success": False, "message": "Invalid OTP"}
+    # Check if user already registered (has account)
+    user = await db.users.find_one({"phone": request.phone})
+    if user:
+        return {"success": True, "user": serialize_doc(user), "isNewUser": False}
+    return {"success": True, "isNewUser": True, "phone": request.phone}
+
+@api_router.post("/auth/login")
+async def login_mpin(request: LoginRequest):
+    """Login with phone + MPIN. No OTP."""
+    if len(request.mpin) < 4 or len(request.mpin) > 6:
+        raise HTTPException(status_code=400, detail="MPIN must be 4-6 digits")
+    user = await db.users.find_one({"phone": request.phone})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found. Please register first.")
+    mpin_hash = user.get("mpinHash")
+    if not mpin_hash:
+        raise HTTPException(status_code=400, detail="MPIN not set. Complete registration first.")
+    if hash_mpin(request.mpin) != mpin_hash:
+        raise HTTPException(status_code=401, detail="Invalid MPIN")
+    return {"success": True, "user": serialize_doc(user)}
+
+@api_router.post("/auth/set-mpin")
+async def set_mpin(request: SetMPINRequest):
+    """Set MPIN for a user (after registration)."""
+    if len(request.mpin) < 4 or len(request.mpin) > 6:
+        raise HTTPException(status_code=400, detail="MPIN must be 4-6 digits")
+    user = await db.users.find_one({"phone": request.phone})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one(
+        {"phone": request.phone},
+        {"$set": {"mpinHash": hash_mpin(request.mpin)}}
+    )
+    return {"success": True, "message": "MPIN set successfully"}
 
 # User endpoints
 @api_router.post("/users", response_model=User)
 async def create_user(user: UserCreate):
     user_dict = user.dict()
-    user_dict["freeJobsRemaining"] = 2
+    # Only employers get free job postings; seekers get 0
+    user_dict["freeJobsRemaining"] = 2 if user_dict.get("role") == "employer" else 0
     user_dict["createdAt"] = datetime.utcnow()
     result = await db.users.insert_one(user_dict)
     user_dict["id"] = str(result.inserted_id)
@@ -340,13 +386,21 @@ async def get_seeker_applications(seeker_id: str):
     return [serialize_doc(app) for app in applications]
 
 @api_router.put("/applications/{application_id}/status")
-async def update_application_status(application_id: str, status: str):
-    result = await db.applications.update_one(
+async def update_application_status(
+    application_id: str,
+    status: str,
+    employer_id: str = Query(..., description="Employer updating (must own the job)")
+):
+    app = await db.applications.find_one({"_id": ObjectId(application_id)})
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    job = await db.jobs.find_one({"_id": ObjectId(app["jobId"])})
+    if not job or job.get("employerId") != employer_id:
+        raise HTTPException(status_code=403, detail="Only the job employer can update application status")
+    await db.applications.update_one(
         {"_id": ObjectId(application_id)},
         {"$set": {"status": status}}
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Application not found")
     return {"success": True}
 
 # Message endpoints
@@ -443,8 +497,10 @@ async def create_payment_order(order: PaymentOrderCreate, employer_id: str):
 
 @api_router.post("/payments/verify")
 async def verify_payment(payment: PaymentVerify, employer_id: str):
+    employer = await db.users.find_one({"_id": ObjectId(employer_id)})
+    if not employer or employer.get("role") != "employer":
+        raise HTTPException(status_code=403, detail="Only employers can purchase job posts")
     # In production, verify signature using Razorpay
-    # For demo, just accept and credit free jobs
     await db.users.update_one(
         {"_id": ObjectId(employer_id)},
         {"$inc": {"freeJobsRemaining": 1}}

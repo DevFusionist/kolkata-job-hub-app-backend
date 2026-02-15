@@ -1,4 +1,4 @@
-#!/home/arindam/Desktop/kolkata-job-hub-app/backend/venv/bin/python3
+#!/home/arindam/Desktop/Kolkata-job-hub/kolkata-job-hub-app-backend/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
