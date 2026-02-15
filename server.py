@@ -172,7 +172,9 @@ Rules: If user says "apply", "apply kore dao", "apply koro", "apply korte chai" 
 User message: "{text}"
 JSON:"""
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # GEMINI_MODEL env overrides default (e.g. gemini-pro if 2.0-flash not available)
+        model_id = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        model = genai.GenerativeModel(model_id)
         response = model.generate_content(prompt)
         raw = (response.text or "").strip()
         # Strip markdown code block if present
