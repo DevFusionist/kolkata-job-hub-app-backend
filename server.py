@@ -6,12 +6,22 @@ import json
 import os
 import logging
 import hashlib
+import re
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 import razorpay
+
+# Optional: Gemini for AI voice command parsing
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = bool(os.environ.get("GEMINI_API_KEY"))
+    if GEMINI_AVAILABLE:
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+except Exception:
+    GEMINI_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -133,6 +143,77 @@ class LoginRequest(BaseModel):
 class SetMPINRequest(BaseModel):
     phone: str
     mpin: str  # 4-6 digit PIN
+
+
+# --- Protibha Voice / AI command parsing ---
+class VoiceCommandParams(BaseModel):
+    """Structured output from LLM: job search params extracted from user text (Bengali/Hinglish/English)."""
+    job_role_or_title: Optional[str] = None
+    category: Optional[str] = None
+    experience_level: Optional[str] = None
+    days_ago: Optional[int] = None
+    location: Optional[str] = None
+    job_type: Optional[str] = None  # Full-time, Part-time
+    auto_apply: bool = False
+
+
+class ProcessCommandRequest(BaseModel):
+    text: str
+    userId: str
+
+
+def _parse_voice_command_with_gemini(text: str) -> VoiceCommandParams:
+    """Use Gemini to extract job search params from natural language (Bengali/Hinglish/English)."""
+    if not GEMINI_AVAILABLE:
+        return VoiceCommandParams()
+    prompt = f"""You are Protibha, a job assistant for Kolkata workers. Extract job search parameters from the user message.
+User may speak in Bengali, Hinglish, or English. Return ONLY a valid JSON object (no markdown, no extra text) with these keys: job_role_or_title, category, experience_level, days_ago, location, job_type, auto_apply.
+Rules: If user says "apply", "apply kore dao", "apply koro", "apply korte chai" -> auto_apply = true. For experience use exactly: Fresher, 1-2 years, 3-5 years, or 5+ years. For job_type use exactly: Full-time or Part-time.
+User message: "{text}"
+JSON:"""
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        raw = (response.text or "").strip()
+        # Strip markdown code block if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        data = json.loads(raw)
+        return VoiceCommandParams(
+            job_role_or_title=data.get("job_role_or_title"),
+            category=data.get("category"),
+            experience_level=data.get("experience_level"),
+            days_ago=data.get("days_ago"),
+            location=data.get("location"),
+            job_type=data.get("job_type"),
+            auto_apply=bool(data.get("auto_apply", False)),
+        )
+    except Exception as e:
+        logger.warning("Gemini parse failed: %s", e)
+        return VoiceCommandParams()
+
+
+def _build_job_query_from_params(params: VoiceCommandParams) -> dict:
+    """Build MongoDB filter from parsed voice command params."""
+    query = {"status": "active"}
+    if params.job_role_or_title:
+        query["$or"] = [
+            {"title": {"$regex": params.job_role_or_title, "$options": "i"}},
+            {"category": {"$regex": params.job_role_or_title, "$options": "i"}},
+        ]
+    if params.category:
+        query["category"] = {"$regex": params.category, "$options": "i"}
+    if params.experience_level:
+        query["experience"] = params.experience_level
+    if params.days_ago is not None and params.days_ago >= 0:
+        since = datetime.utcnow() - timedelta(days=params.days_ago)
+        query["postedDate"] = {"$gte": since}
+    if params.job_type:
+        query["jobType"] = params.job_type
+    if params.location:
+        query["location"] = {"$regex": params.location, "$options": "i"}
+    return query
+
 
 def hash_mpin(mpin: str) -> str:
     salt = os.environ.get("MPIN_SALT", "kolkata-job-hub-mpin-salt")
@@ -402,6 +483,58 @@ async def update_application_status(
         {"$set": {"status": status}}
     )
     return {"success": True}
+
+
+# --- Protibha AI: voice/text command -> job search (and optional auto-apply intent) ---
+@api_router.post("/ai/process-command")
+async def process_voice_command(request: ProcessCommandRequest):
+    """
+    Parse natural language (Bengali/Hinglish/English) into job filters, run query, return jobs.
+    Only job seekers. Does NOT create applications; frontend confirms then calls POST /applications.
+    """
+    user = await db.users.find_one({"_id": ObjectId(request.userId)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.get("role") != "seeker":
+        raise HTTPException(status_code=403, detail="Only job seekers can use voice job search")
+
+    text = (request.text or "").strip()
+    if not text:
+        return {
+            "action": "search_only",
+            "jobs": [],
+            "count": 0,
+            "message": "Please say or type what kind of jobs you want.",
+            "summaryForTTS": "Kichhu bujhte parlam na. Abar bolun.",
+        }
+
+    params = _parse_voice_command_with_gemini(text)
+    query = _build_job_query_from_params(params)
+    jobs_cursor = db.jobs.find(query).sort("postedDate", -1).limit(50)
+    jobs = await jobs_cursor.to_list(50)
+    jobs_serialized = [serialize_doc(j) for j in jobs]
+    count = len(jobs_serialized)
+
+    action = "search_and_apply" if params.auto_apply and count > 0 else "search_only"
+    role_desc = params.job_role_or_title or params.category or "job"
+    if count == 0:
+        message = f"No {role_desc} jobs found."
+        summary_for_tts = f"{role_desc} er kono chakri khuje paini."
+    else:
+        message = f"Found {count} {role_desc} job(s)."
+        summary_for_tts = f"Ami {count} ti {role_desc} job khunje peyechi."
+        if action == "search_and_apply":
+            message += " Should I apply to all?"
+            summary_for_tts += " Sob e apply korte chaiben?"
+
+    return {
+        "action": action,
+        "jobs": jobs_serialized,
+        "count": count,
+        "message": message,
+        "summaryForTTS": summary_for_tts,
+    }
+
 
 # Message endpoints
 @api_router.post("/messages", response_model=Message)
