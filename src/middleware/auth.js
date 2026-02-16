@@ -2,13 +2,28 @@ import { getDb } from "../config/db.js";
 import { toObjectId } from "../utils.js";
 
 /**
- * Require seeker_id (query or body). Validates user exists and has role "seeker".
- * Sets req.seeker on success.
+ * Require seeker. If JWT already set req.seeker (via verifyToken), use that.
+ * Otherwise falls back to legacy seeker_id from query/body.
  */
 export async function requireSeeker(req, res, next) {
+  // JWT path: already authenticated
+  if (req.seeker && req.seekerId) {
+    return next();
+  }
+  // If JWT set userId but role isn't seeker
+  if (req.userId && req.userRole && req.userRole !== "seeker") {
+    return res.status(403).json({ detail: "Only job seekers can perform this action" });
+  }
+  if (req.userId && req.userRole === "seeker") {
+    req.seekerId = req.userId;
+    req.seeker = req.user;
+    return next();
+  }
+
+  // Legacy fallback: seeker_id from query or body
   const seekerId = req.query.seeker_id ?? req.body?.seeker_id ?? req.body?.seekerId;
   if (!seekerId) {
-    return res.status(401).json({ detail: "seeker_id required (query or body)" });
+    return res.status(401).json({ detail: "Authentication required" });
   }
   try {
     const db = getDb();
@@ -25,13 +40,25 @@ export async function requireSeeker(req, res, next) {
 }
 
 /**
- * Require employer_id (query or body). Validates user exists and has role "employer".
- * Sets req.employer on success.
+ * Require employer. If JWT already set req.employer (via verifyToken), use that.
+ * Otherwise falls back to legacy employer_id from query/body.
  */
 export async function requireEmployer(req, res, next) {
+  if (req.employer && req.employerId) {
+    return next();
+  }
+  if (req.userId && req.userRole && req.userRole !== "employer") {
+    return res.status(403).json({ detail: "Only employers can perform this action" });
+  }
+  if (req.userId && req.userRole === "employer") {
+    req.employerId = req.userId;
+    req.employer = req.user;
+    return next();
+  }
+
   const employerId = req.query.employer_id ?? req.body?.employer_id ?? req.body?.employerId;
   if (!employerId) {
-    return res.status(401).json({ detail: "employer_id required (query or body)" });
+    return res.status(401).json({ detail: "Authentication required" });
   }
   try {
     const db = getDb();
@@ -48,14 +75,17 @@ export async function requireEmployer(req, res, next) {
 }
 
 /**
- * Require any authenticated user (userId, seekerId, or employerId in body/query).
- * Sets req.user and req.userId.
+ * Require any authenticated user. JWT-first, then legacy fallback.
  */
 export async function requireUser(req, res, next) {
+  if (req.userId && req.user) {
+    return next();
+  }
+
   const userId = req.query.user_id ?? req.query.seeker_id ?? req.query.employer_id ?? req.query.sender_id
     ?? req.body?.userId ?? req.body?.user_id ?? req.body?.seekerId ?? req.body?.seeker_id ?? req.body?.employerId ?? req.body?.employer_id ?? req.body?.senderId ?? req.body?.sender_id;
   if (!userId) {
-    return res.status(401).json({ detail: "User ID required (userId, seeker_id, or employer_id)" });
+    return res.status(401).json({ detail: "Authentication required" });
   }
   try {
     const db = getDb();

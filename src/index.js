@@ -1,9 +1,11 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { connectDb, getDb, closeDb } from "./config/db.js";
 import { setWsSendMessage } from "./routes/messages.js";
 import { requestLogger } from "./middleware/requestLogger.js";
+import { verifyToken } from "./middleware/jwt.js";
 import authRoutes from "./routes/auth.js";
 import userRoutes from "./routes/users.js";
 import jobRoutes from "./routes/jobs.js";
@@ -17,9 +19,49 @@ import { WebSocketServer } from "ws";
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-app.use(cors({ origin: "*", credentials: true }));
+// Allowed origins (add your frontend URLs)
+const ALLOWED_ORIGINS = [
+  "http://localhost:8081",
+  "http://localhost:19006",
+  "exp://localhost:8081",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow requests with no origin (mobile apps, curl, etc.)
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // In dev mode, allow all
+      if (process.env.NODE_ENV !== "production") return cb(null, true);
+      cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(requestLogger);
+
+// Global rate limiter: 100 requests per minute per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { detail: "Too many requests, please try again later" },
+});
+app.use("/api", globalLimiter);
+
+// Stricter limiter for auth endpoints: 10 per minute
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { detail: "Too many auth attempts, please try again later" },
+});
+app.use("/api/auth", authLimiter);
+
+// JWT verification: runs on all /api routes, sets req.userId etc. if token present
+app.use("/api", verifyToken);
 
 // Health
 app.get("/api/health", async (req, res) => {

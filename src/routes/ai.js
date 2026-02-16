@@ -15,9 +15,9 @@ const router = Router();
 router.post("/ai/chat", requireUser, async (req, res) => {
   const userId = req.userId;
   const user = req.user;
-  const { messages = [], jobDraft = null } = req.body;
+  const { messages = [], jobDraft = null, lastJobs = [] } = req.body;
   try {
-    const result = await handleProtibhaChat(userId, user.role, messages, jobDraft);
+    const result = await handleProtibhaChat(userId, user.role, messages, jobDraft, { lastJobs });
     res.json(result);
   } catch (e) {
     console.error("Protibha chat error:", e);

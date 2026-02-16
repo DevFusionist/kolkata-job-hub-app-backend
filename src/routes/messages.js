@@ -13,11 +13,33 @@ export function setWsSendMessage(fn) {
 router.post("/messages", requireUser, async (req, res) => {
   const senderId = req.userId;
   const { receiverId, jobId, message } = req.body;
+
+  if (!receiverId) {
+    return res.status(400).json({ detail: "receiverId is required" });
+  }
+  if (!message || message.trim().length === 0) {
+    return res.status(400).json({ detail: "Message cannot be empty" });
+  }
+  if (message.length > 1000) {
+    return res.status(400).json({ detail: "Message too long (max 1000 characters)" });
+  }
+  if (receiverId === senderId) {
+    return res.status(400).json({ detail: "Cannot send message to yourself" });
+  }
+
+  // Verify receiver exists
   const db = getDb();
+  try {
+    const receiver = await db.collection("users").findOne({ _id: toObjectId(receiverId) });
+    if (!receiver) return res.status(404).json({ detail: "Receiver not found" });
+  } catch {
+    return res.status(400).json({ detail: "Invalid receiverId" });
+  }
+
   const msg = {
     receiverId,
-    jobId,
-    message,
+    jobId: jobId || "",
+    message: message.trim(),
     senderId,
     timestamp: new Date(),
     read: false,
@@ -28,8 +50,8 @@ router.post("/messages", requireUser, async (req, res) => {
     id: msg.id,
     senderId,
     receiverId,
-    message,
-    jobId: jobId || "",
+    message: msg.message,
+    jobId: msg.jobId,
     timestamp: msg.timestamp.toISOString(),
     read: false,
   };
@@ -39,7 +61,14 @@ router.post("/messages", requireUser, async (req, res) => {
 
 router.get("/messages/:userId", async (req, res) => {
   const otherUserId = req.query.other_user_id;
+  if (!otherUserId) {
+    return res.status(400).json({ detail: "other_user_id query param required" });
+  }
   const db = getDb();
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, parseInt(req.query.limit) || 50);
+  const skip = (page - 1) * limit;
+
   const messages = await db.collection("messages")
     .find({
       $or: [
@@ -48,7 +77,8 @@ router.get("/messages/:userId", async (req, res) => {
       ],
     })
     .sort({ timestamp: 1 })
-    .limit(1000)
+    .skip(skip)
+    .limit(limit)
     .toArray();
   res.json(messages.map(serializeDoc));
 });
@@ -64,19 +94,32 @@ router.get("/messages/conversations/:userId", async (req, res) => {
         lastMessage: { $first: "$$ROOT" },
       },
     },
+    { $limit: 50 },
   ];
-  const convs = await db.collection("messages").aggregate(pipeline).limit(100).toArray();
-  const result = [];
-  for (const c of convs) {
-    const other = await db.collection("users").findOne({ _id: toObjectId(c._id) });
-    if (other) {
-      result.push({
+  const convs = await db.collection("messages").aggregate(pipeline).toArray();
+
+  // Batch-fetch all user docs instead of N+1
+  const userIds = convs.map((c) => {
+    try { return toObjectId(c._id); } catch { return null; }
+  }).filter(Boolean);
+
+  const users = userIds.length
+    ? await db.collection("users").find({ _id: { $in: userIds } }).toArray()
+    : [];
+  const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+
+  const result = convs
+    .map((c) => {
+      const other = userMap.get(c._id);
+      if (!other) return null;
+      return {
         userId: c._id,
         userName: other.name,
         lastMessage: serializeDoc(c.lastMessage),
-      });
-    }
-  }
+      };
+    })
+    .filter(Boolean);
+
   res.json(result);
 });
 

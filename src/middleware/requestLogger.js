@@ -1,8 +1,9 @@
 /**
  * Request logging middleware.
  * Logs: method, path, query, sanitized body, duration, status, response summary.
+ * Note: Only the LOG output is sanitized (mpin/password etc show as [REDACTED]).
+ * req.body is never modified – route handlers still receive the real values.
  */
-
 const SENSITIVE_KEYS = new Set(["mpin", "mpinHash", "password", "otp", "token", "apiKey", "api_key"]);
 const TRUNCATE_KEYS = new Set(["audiobase64", "audio_base64"]); // truncate base64 audio in logs
 const MAX_BODY_LOG = 500;

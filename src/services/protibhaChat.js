@@ -5,7 +5,7 @@
 import OpenAI from "openai";
 import { getDb } from "../config/db.js";
 import { serializeDoc, toObjectId } from "../utils.js";
-import { rankJobsForSeeker, generateJobFromText } from "./ai.js";
+import { rankJobsForSeeker } from "./ai.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_AVAILABLE = !!process.env.OPENAI_API_KEY;
@@ -32,10 +32,9 @@ function parseJsonFromResponse(raw) {
 const JOB_CATEGORIES = ["Sales", "Delivery", "Retail", "Hospitality", "Office Work", "Driver", "Warehouse", "Restaurant", "Security", "Beautician", "Other"];
 const JOB_TYPES = ["Full-time", "Part-time"];
 const EXPERIENCE_LEVELS = ["Fresher", "1-2 years", "3-5 years", "5+ years"];
+const MAX_DESCRIPTION_LEN = 2000;
+const MIN_DESCRIPTION_LEN = 8;
 
-/**
- * Determine next missing field for job creation and extract value from user message.
- */
 function getNextJobStep(jobDraft) {
   if (!jobDraft.category || jobDraft.category === "?") return "category";
   if (!jobDraft.location || jobDraft.location === "?") return "location";
@@ -46,9 +45,6 @@ function getNextJobStep(jobDraft) {
   return "confirm";
 }
 
-/**
- * Map free text to category (fuzzy match).
- */
 function resolveCategory(text) {
   const t = (text || "").toLowerCase().trim();
   for (const c of JOB_CATEGORIES) {
@@ -63,9 +59,6 @@ function resolveCategory(text) {
   return text?.trim() || null;
 }
 
-/**
- * Extract salary from text like "12 to 15 thousand", "₹10000".
- */
 function extractSalary(text) {
   const t = (text || "").toLowerCase();
   const match = t.match(/(\d+)\s*(?:to|-|–)\s*(\d+)\s*(?:thousand|k|000)?/i) ||
@@ -82,9 +75,6 @@ function extractSalary(text) {
   return null;
 }
 
-/**
- * Parse employer response to fill job draft.
- */
 function parseEmployerResponse(step, userText, jobDraft) {
   const text = (userText || "").trim();
   if (!text) return { ...jobDraft };
@@ -120,22 +110,25 @@ function parseEmployerResponse(step, userText, jobDraft) {
 }
 
 /**
- * Build seeker system prompt with user context.
+ * Build seeker system prompt – ONLY for intent classification, not for generating user-facing replies.
  */
 function buildSeekerSystem(user) {
   const skills = [...new Set([...(user.skills || []), ...(user.aiExtracted?.skills || [])])];
   const exp = user.aiExtracted?.experience || user.experience || "Fresher";
   const loc = user.location || "";
-  return `You are Protibha, a friendly Bengali-English job assistant for Kolkata Job Hub. The user is a JOB SEEKER.
+  return `You are an intent classifier for a job platform chat. The user is a JOB SEEKER.
 User profile: skills=${JSON.stringify(skills)}, experience=${exp}, location=${loc}
 
-You help seekers:
-1. Find jobs - "find me recent jobs", "delivery jobs in salt lake", "beautician jobs"
-2. Apply to jobs - "apply to the first one", "apply to all", "apply to job X"
+Classify the user's message into ONE of these intents:
+- "search" – user wants to find/browse/see jobs (e.g. "beautician jobs", "find me delivery jobs", "show recent jobs")
+- "apply" – user wants to apply to a job (e.g. "apply to the first one", "apply to all")
+- "general" – general question, greeting, or unrelated to job search/apply
 
-Be warm, concise, use a mix of English and Bengali (Banglish) when natural. Keep replies short (1-3 sentences).
-When showing jobs, say how many you found and that they're based on their profile.
-When they want to apply, confirm which job(s) before applying.`;
+Extract the search_query (the key terms to search for, e.g. "beautician", "delivery in salt lake").
+Extract apply_target if intent is apply ("first", "all", or a job ID).
+
+Respond ONLY with valid JSON. Keys: intent, search_query, apply_target.
+Do NOT generate any user-facing reply or job count. Do NOT hallucinate data.`;
 }
 
 function escapeRegex(input) {
@@ -164,7 +157,72 @@ function getCategoryHint(text) {
   if (/warehouse|packing|picker/.test(t)) return "Warehouse";
   if (/restaurant|cook|chef|kitchen|waiter/.test(t)) return "Restaurant";
   if (/security|guard/.test(t)) return "Security";
+  if (/hospitality|hotel/.test(t)) return "Hospitality";
+  if (/office|admin|clerk/.test(t)) return "Office Work";
   return null;
+}
+
+function sanitizeCategory(cat) {
+  if (!cat) return null;
+  const found = JOB_CATEGORIES.find((c) => c.toLowerCase() === String(cat).toLowerCase());
+  return found || null;
+}
+
+function sanitizeJobType(jt) {
+  if (!jt) return null;
+  const found = JOB_TYPES.find((c) => c.toLowerCase() === String(jt).toLowerCase().replace("-", ""));
+  return found || null;
+}
+
+function sanitizeExperience(ex) {
+  if (!ex) return null;
+  const found = EXPERIENCE_LEVELS.find((c) => c.toLowerCase() === String(ex).toLowerCase());
+  return found || null;
+}
+
+function sanitizeLastJobs(contextLastJobs) {
+  if (!Array.isArray(contextLastJobs)) return [];
+  return contextLastJobs
+    .map((j) => {
+      const id = typeof j?.id === "string" ? j.id : typeof j?._id === "string" ? j._id : null;
+      if (!id || !/^[a-f\\d]{24}$/i.test(id)) return null;
+      return { id };
+    })
+    .filter(Boolean);
+}
+
+async function fetchActiveJobsByIds(db, ids) {
+  const validIds = ids.filter((id) => /^[a-f\\d]{24}$/i.test(id));
+  if (!validIds.length) return [];
+  const objectIds = validIds.map((id) => toObjectId(id));
+  const jobsRaw = await db.collection("jobs").find({ _id: { $in: objectIds }, status: "active" }).toArray();
+  for (const j of jobsRaw) j.id = j._id.toString();
+  return jobsRaw;
+}
+
+function parseOrdinalIndex(text) {
+  const t = normalizeSearchInput(text);
+  if (/second|2nd|ditiyo/i.test(t)) return 1;
+  if (/third|3rd|tritiyo/i.test(t)) return 2;
+  if (/fourth|4th|choththo/i.test(t)) return 3;
+  return 0; // default to first when ordinal mentioned; caller decides whether to use
+}
+
+function validateEmployerJobDraft(draft) {
+  const errors = [];
+  const cat = sanitizeCategory(draft.category);
+  if (!cat) errors.push("Invalid category");
+  if (!draft.location || String(draft.location).trim().length < 2) errors.push("Location required");
+  if (!draft.salary || String(draft.salary).trim().length < 2) errors.push("Salary required");
+  const jt = sanitizeJobType(draft.jobType);
+  if (!jt) errors.push("Invalid job type");
+  const ex = sanitizeExperience(draft.experience);
+  if (!ex) errors.push("Invalid experience");
+  const desc = String(draft.description || "").trim();
+  if (!desc || desc.length < MIN_DESCRIPTION_LEN || desc.length > MAX_DESCRIPTION_LEN) {
+    errors.push("Description length invalid");
+  }
+  return { errors, cat, jt, ex, desc };
 }
 
 function getLocationHint(text, generatedLocation) {
@@ -179,18 +237,31 @@ function getLocationHint(text, generatedLocation) {
 const SEEKER_QUERY_STOP_WORDS = new Set([
   "find", "search", "show", "jobs", "job", "recent", "latest", "new", "me",
   "in", "at", "near", "for", "please", "a", "the", "all", "iin",
+  "khujo", "dikhau", "dikhay", "chai", "want", "need", "give",
 ]);
 
-async function getRankedJobsForSeeker(db, user, queryText, { dbLimit = 30, rankLimit = 10 } = {}) {
+/**
+ * Search for jobs matching the query. Returns ONLY genuinely matching jobs.
+ * If nothing matches, returns empty array – does NOT fall back to unrelated jobs.
+ */
+async function searchJobsForSeeker(db, user, queryText, { dbLimit = 30, rankLimit = 10 } = {}) {
   const normalized = normalizeSearchInput(queryText);
-  const recentOnly = /recent|latest|new|akhon/.test(normalized);
-  const generated = await generateJobFromText(normalized, user.location || "Kolkata");
-  let categoryHint = getCategoryHint(normalized);
-  if (!categoryHint && generated.category && generated.category !== "Other") {
-    categoryHint = generated.category;
-  }
-  const locationHint = recentOnly ? null : getLocationHint(normalized, generated.location);
+  const recentOnly = /recent|latest|new|akhon|sob|all/.test(normalized);
 
+  // If user just wants recent/all jobs, return them directly
+  if (recentOnly && !getCategoryHint(normalized)) {
+    const jobsRaw = await db.collection("jobs").find({ status: "active" }).sort({ postedDate: -1 }).limit(dbLimit).toArray();
+    for (const j of jobsRaw) j.id = j._id.toString();
+    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit);
+    const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
+    return rankedIds.map((id) => idToJob[id]).filter(Boolean);
+  }
+
+  // Try to extract category and location hints (only from user text, no LLM guess)
+  const categoryHint = getCategoryHint(normalized);
+  const locationHint = getLocationHint(normalized, user.location);
+
+  // Build the search query
   const primaryQuery = { status: "active" };
 
   if (categoryHint) {
@@ -201,7 +272,7 @@ async function getRankedJobsForSeeker(db, user, queryText, { dbLimit = 30, rankL
       { description: categoryRegex },
       { skills: categoryRegex },
     ];
-  } else if (!recentOnly && normalized.length > 2) {
+  } else if (normalized.length > 2) {
     const tokens = normalized
       .split(/\s+/)
       .filter((w) => w.length > 2 && !SEEKER_QUERY_STOP_WORDS.has(w))
@@ -223,16 +294,17 @@ async function getRankedJobsForSeeker(db, user, queryText, { dbLimit = 30, rankL
 
   let jobsRaw = await db.collection("jobs").find(primaryQuery).sort({ postedDate: -1 }).limit(dbLimit).toArray();
 
-  // Fallback 1: if strict location caused zero, retry without location.
-  if (!jobsRaw.length && primaryQuery.location) {
+  // Fallback: if strict location caused zero results, retry without location
+  // but KEEP the category/keyword filter so we only return relevant jobs
+  if (!jobsRaw.length && primaryQuery.location && primaryQuery.$or) {
     const withoutLocation = { ...primaryQuery };
     delete withoutLocation.location;
     jobsRaw = await db.collection("jobs").find(withoutLocation).sort({ postedDate: -1 }).limit(dbLimit).toArray();
   }
 
-  // Fallback 2: if still empty, return recent active jobs and rely on ranking.
-  if (!jobsRaw.length && (primaryQuery.$or || primaryQuery.location)) {
-    jobsRaw = await db.collection("jobs").find({ status: "active" }).sort({ postedDate: -1 }).limit(dbLimit).toArray();
+  // NO Fallback 2: if still empty, return empty. Don't return random unrelated jobs.
+  if (!jobsRaw.length) {
+    return [];
   }
 
   for (const j of jobsRaw) j.id = j._id.toString();
@@ -242,9 +314,35 @@ async function getRankedJobsForSeeker(db, user, queryText, { dbLimit = 30, rankL
 }
 
 /**
+ * Detect intent locally from text (fast, no LLM needed for obvious cases).
+ */
+function detectLocalIntent(text) {
+  const t = normalizeSearchInput(text);
+  if (/apply|kore\s*dao|kore\s*de|diyo|aply/i.test(t)) return "apply";
+  if (/find|search|khujo|dikhau|dikhay|jobs?\b|khuje|recent|latest|show|dekha|chai/i.test(t)) return "search";
+  // Check if text mentions a known category (implicit search)
+  if (getCategoryHint(t)) return "search";
+  return null;
+}
+
+/**
+ * Build a user-facing search result message based on ACTUAL results.
+ */
+function buildSearchResultMessage(jobs, searchTerm) {
+  const term = searchTerm || "search";
+  if (jobs.length === 0) {
+    return `"${term}" diye kono job khuje paini. Onno category ba keyword try koren, ba "recent jobs" bolen sob dekhte.`;
+  }
+  if (jobs.length === 1) {
+    return `"${term}" diye 1 ti job peyechi. Ekhane dekhen:`;
+  }
+  return `"${term}" diye ${jobs.length} ti job peyechi. Ekhane dekhen:`;
+}
+
+/**
  * Main chat handler: routes by role, performs actions, returns response.
  */
-export async function handleProtibhaChat(userId, role, messages, jobDraft = null) {
+export async function handleProtibhaChat(userId, role, messages, jobDraft = null, context = {}) {
   const db = getDb();
   const user = await db.collection("users").findOne({ _id: toObjectId(userId) });
   if (!user) return { message: "User not found.", action: "error" };
@@ -254,11 +352,11 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
   if (!lastContent) {
     const greeting = role === "seeker"
       ? "Hi! I'm Protibha. How can I help you today? Ami apnar profile onujayi jobs khuje dite pari. বলুন আপনি কি খুঁজছেন?"
-      : "Hi! I'm Protibha. How can I help you today? Ami apnake job post korte sahajjo korbo. Ki khaben – ki rokom chakri post korben?";
+      : "Hi! I'm Protibha. How can I help you today? Ami apnake job post korte sahajjo korbo – ki rokom chakri post korben?";
     return { message: greeting, action: "greeting" };
   }
 
-  // Employer: job creation flow
+  // ===== EMPLOYER: job creation flow =====
   if (role === "employer") {
     const draft = jobDraft || {
       category: "?",
@@ -272,31 +370,47 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
     const step = getNextJobStep(draft);
     const updatedDraft = parseEmployerResponse(step, lastContent, draft);
 
-    // Check for confirm
     const confirmWords = /yes|হ্যাঁ|হাঁ|ok|post|করুন|korum|confirm|ঠিক আছে/i;
     if (step === "confirm" && confirmWords.test(lastContent)) {
       const employer = await db.collection("users").findOne({ _id: toObjectId(userId) });
       if (!employer || employer.role !== "employer") {
         return { message: "Only employers can post jobs.", action: "error" };
       }
-      if (employer.freeJobsRemaining <= 0) {
+      const remaining = Number.isFinite(employer?.freeJobsRemaining) ? employer.freeJobsRemaining : 0;
+      if (remaining <= 0) {
         return {
           message: "Apnar free job post sesh. Payment required.",
           action: "payment_required",
         };
       }
+      const { errors, cat, jt, ex, desc } = validateEmployerJobDraft(updatedDraft);
+      if (errors.length) {
+        return { message: `Job details invalid: ${errors.join(", ")}`, action: "error" };
+      }
+
       const title = `${updatedDraft.category} - ${updatedDraft.location}`.replace(/\?/g, "Kolkata");
+      // Prevent accidental duplicate spam (same employer + title + location in last 5 minutes)
+      const recentDup = await db.collection("jobs").findOne({
+        employerId: userId,
+        title,
+        location: updatedDraft.location,
+        postedDate: { $gte: new Date(Date.now() - 5 * 60 * 1000) },
+      });
+      if (recentDup) {
+        return { message: "You just posted a similar job moments ago.", action: "error" };
+      }
+
       const jobDoc = {
         title: title,
-        category: updatedDraft.category,
-        description: updatedDraft.description || "See requirements.",
+        category: cat,
+        description: desc || "See requirements.",
         salary: updatedDraft.salary,
         location: updatedDraft.location,
-        jobType: updatedDraft.jobType || "Full-time",
-        experience: updatedDraft.experience || "Fresher",
+        jobType: jt || "Full-time",
+        experience: ex || "Fresher",
         education: "Any",
         languages: ["Bengali", "Hindi", "English"],
-        skills: [updatedDraft.category],
+        skills: [cat],
         employerId: userId,
         employerName: employer.name,
         employerPhone: employer.phone,
@@ -336,41 +450,67 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
     };
   }
 
-  // Seeker: job search and apply
+  // ===== SEEKER: job search and apply =====
   if (role === "seeker") {
-    const client = getClient();
-    if (!client) {
-      return { message: "AI service unavailable. Please try the search tab.", action: "error" };
+    // Step 1: Try to detect intent locally (fast, no LLM call needed)
+    let intent = detectLocalIntent(lastContent);
+    let searchQuery = lastContent;
+    let applyTarget = null;
+    const contextJobs = sanitizeLastJobs(context.lastJobs);
+    const contextJobIds = contextJobs.map((j) => j.id);
+
+    // Step 2: If local detection fails, use LLM for intent classification only
+    if (!intent) {
+      const client = getClient();
+      if (client) {
+        try {
+          const system = buildSeekerSystem(user);
+          const history = messages.slice(-6).map((m) => ({ role: m.role, content: m.content }));
+          history.unshift({ role: "system", content: system });
+
+          const completion = await client.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: history,
+            temperature: 0.2,
+            response_format: { type: "json_object" },
+          });
+          const raw = (completion.choices[0]?.message?.content || "").trim();
+          const parsed = parseJsonFromResponse(raw) || {};
+
+          intent = (parsed.intent || "general").toLowerCase();
+          if (parsed.search_query || parsed.searchQuery) {
+            searchQuery = parsed.search_query || parsed.searchQuery;
+          }
+          applyTarget = parsed.apply_target || parsed.applyTarget || null;
+        } catch (err) {
+          console.error("LLM intent classification failed:", err.message);
+          intent = "search"; // Default to search on LLM failure
+        }
+      } else {
+        intent = "search"; // No LLM available, default to search
+      }
     }
 
-    const system = buildSeekerSystem(user) + "\n\nRespond only with valid JSON. Keys: intent (search/find/apply/general), reply, search_query, apply_target when relevant.";
-    const history = messages.slice(-6).map((m) => ({ role: m.role, content: m.content }));
-    history.unshift({ role: "system", content: system });
+    // Step 3: Execute the intent with REAL data
+    if (intent === "search" || intent === "find") {
+      const wantsNearMe = /\bnear me\b|\bnearby\b|amar kache|pasher|pash[eé]/i.test(searchQuery || lastContent);
+      let effectiveQuery = searchQuery;
 
-    const completion = await client.chat.completions.create({
-      model: OPENAI_MODEL,
-      messages: history,
-      temperature: 0.4,
-      response_format: { type: "json_object" },
-    });
-    const raw = (completion.choices[0]?.message?.content || "").trim();
-    const parsed = parseJsonFromResponse(raw) || {};
+      if (wantsNearMe) {
+        const loc = (user.location || "").trim();
+        effectiveQuery = loc ? `jobs in ${loc}` : "recent jobs";
+      }
 
-    const intent = (parsed.intent || "").toLowerCase();
-    const searchQuery = parsed.search_query || parsed.searchQuery || lastContent;
-    const applyTarget = parsed.apply_target || parsed.applyTarget; // "first", "all", jobId
+      let jobs = (await searchJobsForSeeker(db, user, effectiveQuery)).map((j) => serializeDoc(j));
 
-    console.log("intent", intent, "searchQuery", searchQuery, "applyTarget", applyTarget)
+      // If user asked "near me" but no results, fall back to recent active jobs
+      if (!jobs.length && wantsNearMe) {
+        jobs = (await searchJobsForSeeker(db, user, "recent jobs")).map((j) => serializeDoc(j));
+      }
 
-    // Job search
-    if (intent.includes("search") || intent.includes("find") || /find|search|khujo|dikhau|jobs?|dikhay|recent/i.test(lastContent)) {
-      const combined = searchQuery || lastContent;
-      console.log("combined", combined)
-      const jobs = (await getRankedJobsForSeeker(db, user, combined)).map((j) => serializeDoc(j));
+      const displayTerm = extractSearchDisplayTerm(effectiveQuery);
+      const msg = buildSearchResultMessage(jobs, displayTerm);
 
-      const msg = jobs.length > 0
-        ? `Ami ${jobs.length} ti job khunje peyechi apnar profile onujayi. Ekhane dekhen:`
-        : `Kono job khuje paini "${searchQuery || "search"}". Onno kichhu try koren.`;
       return {
         message: msg,
         action: "show_jobs",
@@ -378,24 +518,59 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       };
     }
 
-    // Apply to job(s)
-    if (intent.includes("apply") || /apply|kore dao|kore de|diyo/i.test(lastContent)) {
-      const combined = searchQuery || lastContent;
-      const jobs = await getRankedJobsForSeeker(db, user, combined);
+    if (intent === "apply") {
+      // First decide which jobs to target
+      const applyTargetId = typeof applyTarget === "string" && /^[a-f\\d]{24}$/i.test(applyTarget) ? applyTarget : null;
+      const ordinalRequested = parseOrdinalIndex(applyTarget || lastContent);
+      const applyAll = /all|sob|সব|all of them/i.test(lastContent) || applyTarget === "all";
+      let jobs = [];
 
-      if (jobs.length === 0) {
-        return { message: "Kono job khuje paini. Age kichhu jobs khunje nin.", action: "show_jobs", payload: { jobs: [] } };
+      // (a) If explicit job ID given, prioritize it
+      if (applyTargetId) {
+        const fromContext = contextJobIds.includes(applyTargetId)
+          ? (await fetchActiveJobsByIds(db, [applyTargetId]))[0]
+          : null;
+        if (fromContext) jobs = [fromContext];
+        else {
+          const job = await db.collection("jobs").findOne({ _id: toObjectId(applyTargetId), status: "active" });
+          if (job) { job.id = job._id.toString(); jobs = [job]; }
+        }
       }
 
-      const applyAll = /all|sob|সব|all of them/i.test(lastContent) || applyTarget === "all";
+      // (b) If no explicit ID but we have context list, use it (all or ordinal)
+      if (!jobs.length && contextJobIds.length) {
+        const contextJobsFull = await fetchActiveJobsByIds(db, contextJobIds);
+        if (applyAll) {
+          jobs = contextJobsFull;
+        } else if (contextJobsFull.length) {
+          const idx = Math.min(Math.max(ordinalRequested, 0), contextJobsFull.length - 1);
+          jobs = [contextJobsFull[idx]];
+        }
+      }
+
+      // (c) Fallback: search again from text
+      if (!jobs.length) {
+        jobs = await searchJobsForSeeker(db, user, searchQuery);
+      }
+
+      if (!jobs.length) {
+        return {
+          message: "Kono job khuje paini apply korar jonno. Age \"find jobs\" ba ekta category bolen.",
+          action: "show_jobs",
+          payload: { jobs: [] },
+        };
+      }
+
       const toApply = applyAll ? jobs : [jobs[0]];
 
       let applied = 0;
+      let alreadyApplied = 0;
       let failed = 0;
       for (const job of toApply) {
         try {
+          if (job.status !== "active") { failed++; continue; }
           const existing = await db.collection("applications").findOne({ jobId: job.id, seekerId: userId });
-          if (existing) continue;
+          if (existing) { alreadyApplied++; continue; }
           const app = {
             jobId: job.id,
             coverLetter: "",
@@ -417,9 +592,17 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
         }
       }
 
-      const msg = applied > 0
-        ? `Ami ${applied} ti job e apply kore diyechi. Good luck!`
-        : failed > 0 ? "Apply korte parlam na. Abar try koren." : "Apni already apply korechen.";
+      let msg;
+      if (applied > 0 && alreadyApplied > 0) {
+        msg = `${applied} ti job e apply korechi! (${alreadyApplied} te already apply kora chhilo.) Good luck!`;
+      } else if (applied > 0) {
+        msg = `${applied} ti job e apply kore diyechi! Good luck!`;
+      } else if (alreadyApplied > 0) {
+        msg = "Apni already ei job(s) e apply korechen.";
+      } else {
+        msg = "Apply korte parlam na. Abar try koren.";
+      }
+
       return {
         message: msg,
         action: "apply_success",
@@ -427,13 +610,50 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       };
     }
 
-    // Fallback: use LLM for natural reply
-    const fallbackReply = parsed.reply || parsed.message || "Ami bujhte parlam na. Bollen: jobs khujo na apply korbo?";
+    // General / fallback: use LLM for a conversational reply (no job data hallucination)
+    const client = getClient();
+    if (client) {
+      try {
+        const system = `You are Protibha, a friendly Bengali-English job assistant for Kolkata Job Hub.
+The user is a job seeker. Help them with general questions.
+Be warm, concise, use a mix of English and Bengali (Banglish).
+Do NOT mention specific job counts or claim to have found jobs.
+If they seem to want jobs, suggest they say "find [category] jobs" or "recent jobs".
+Keep replies to 1-3 sentences.`;
+        const history = messages.slice(-4).map((m) => ({ role: m.role, content: m.content }));
+        history.unshift({ role: "system", content: system });
+
+        const completion = await client.chat.completions.create({
+          model: OPENAI_MODEL,
+          messages: history,
+          temperature: 0.6,
+          max_tokens: 150,
+        });
+        const reply = (completion.choices[0]?.message?.content || "").trim();
+        if (reply) {
+          return { message: reply, action: "message" };
+        }
+      } catch (err) {
+        console.error("LLM fallback reply failed:", err.message);
+      }
+    }
+
     return {
-      message: fallbackReply,
+      message: "Ami bujhte parlam na. Apni bolen: \"find delivery jobs\" ba \"recent jobs\" – ami khuje debo!",
       action: "message",
     };
   }
 
   return { message: "How can I help you today?", action: "message" };
+}
+
+/**
+ * Extract a clean display term from the search query (remove stop words).
+ */
+function extractSearchDisplayTerm(query) {
+  const normalized = normalizeSearchInput(query);
+  const tokens = normalized
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !SEEKER_QUERY_STOP_WORDS.has(w));
+  return tokens.join(" ") || query;
 }
