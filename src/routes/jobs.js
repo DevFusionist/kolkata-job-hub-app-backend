@@ -1,29 +1,29 @@
 import { Router } from "express";
-import { getDb } from "../config/db.js";
-import { serializeDoc, toObjectId } from "../utils.js";
+import { Job, User, CATEGORIES, JOB_TYPES, EXPERIENCE_LEVELS, EDUCATION_LEVELS } from "../models/index.js";
+import { serializeDoc } from "../utils.js";
 import { requireEmployer } from "../middleware/auth.js";
 
 const router = Router();
 
-const VALID_CATEGORIES = [
-  "Sales", "Customer Service", "Driving", "Cooking", "Computer",
-  "Accounting", "Warehouse", "Delivery", "Healthcare", "Education",
-  "Construction", "Hospitality", "Retail", "Manufacturing", "Other",
-];
-const VALID_JOB_TYPES = ["Full-time", "Part-time", "Contract", "Temporary", "Internship"];
-const VALID_EXPERIENCE = ["Fresher", "1-2 years", "3-5 years", "5+ years"];
-const VALID_EDUCATION = ["None", "10th Pass", "12th Pass", "Graduate", "Post Graduate"];
+function parseSalaryRange(salary) {
+  const nums = salary.match(/\d+/g);
+  if (!nums || nums.length === 0) return { salaryMin: 0, salaryMax: 0 };
+  const parsed = nums.map(Number);
+  return {
+    salaryMin: parsed[0] || 0,
+    salaryMax: parsed[1] || parsed[0] || 0,
+  };
+}
 
 router.post("/jobs", requireEmployer, async (req, res) => {
   const employerId = req.employerId;
   const employer = req.employer;
   const { title, category, description, salary, location, jobType, experience, education, languages, skills } = req.body;
 
-  // Validation
   if (!title || title.trim().length < 3 || title.trim().length > 100) {
     return res.status(400).json({ detail: "Title required (3-100 characters)" });
   }
-  if (!category || !VALID_CATEGORIES.includes(category)) {
+  if (!category || !CATEGORIES.includes(category)) {
     return res.status(400).json({ detail: "Valid category required" });
   }
   if (!description || description.trim().length < 10 || description.trim().length > 2000) {
@@ -35,13 +35,13 @@ router.post("/jobs", requireEmployer, async (req, res) => {
   if (!location || location.trim().length < 2) {
     return res.status(400).json({ detail: "Location required" });
   }
-  if (!jobType || !VALID_JOB_TYPES.includes(jobType)) {
+  if (!jobType || !JOB_TYPES.includes(jobType)) {
     return res.status(400).json({ detail: "Valid job type required" });
   }
-  if (!experience || !VALID_EXPERIENCE.includes(experience)) {
+  if (!experience || !EXPERIENCE_LEVELS.includes(experience)) {
     return res.status(400).json({ detail: "Valid experience level required" });
   }
-  if (!education || !VALID_EDUCATION.includes(education)) {
+  if (education && !EDUCATION_LEVELS.includes(education)) {
     return res.status(400).json({ detail: "Valid education level required" });
   }
   if (!languages || !Array.isArray(languages) || languages.length === 0) {
@@ -51,18 +51,25 @@ router.post("/jobs", requireEmployer, async (req, res) => {
     return res.status(400).json({ detail: "At least one skill required" });
   }
 
-  const db = getDb();
+  const freshEmployer = await User.findById(employerId);
+  if (!freshEmployer || (freshEmployer.freeJobsRemaining || 0) <= 0) {
+    return res.status(402).json({ detail: "Payment required" });
+  }
 
-  if (employer.freeJobsRemaining > 0) {
-    const jobDoc = {
+  const { salaryMin, salaryMax } = parseSalaryRange(salary);
+
+  try {
+    const job = await Job.create({
       title: title.trim(),
       category,
       description: description.trim(),
       salary: salary.trim(),
+      salaryMin,
+      salaryMax,
       location: location.trim(),
       jobType,
       experience,
-      education,
+      education: education || "Any",
       languages,
       skills,
       employerId,
@@ -73,69 +80,68 @@ router.post("/jobs", requireEmployer, async (req, res) => {
       status: "active",
       applicationsCount: 0,
       isPaid: false,
-    };
+    });
 
-    const r = await db.collection("jobs").insertOne(jobDoc);
-    // Only decrement AFTER successful insert
-    await db.collection("users").updateOne(
-      { _id: toObjectId(employerId) },
-      { $inc: { freeJobsRemaining: -1 } }
-    );
-    jobDoc.id = r.insertedId.toString();
-    res.json(jobDoc);
-  } else {
-    return res.status(402).json({ detail: "Payment required" });
+    freshEmployer.freeJobsRemaining -= 1;
+    await freshEmployer.save();
+
+    res.json(job.toJSON());
+  } catch (err) {
+    if (err.name === "ValidationError") {
+      const msg = Object.values(err.errors).map(e => e.message).join(", ");
+      return res.status(400).json({ detail: msg });
+    }
+    throw err;
   }
 });
 
 router.get("/jobs", async (req, res) => {
   const q = req.query;
-  const db = getDb();
-  const query = { status: "active" };
-  if (q.category) query.category = q.category;
+  const filter = { status: "active" };
+  if (q.category) filter.category = q.category;
   if (q.location) {
-    // Escape regex special chars to prevent ReDoS
     const escaped = q.location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    query.location = new RegExp(escaped, "i");
+    filter.location = new RegExp(escaped, "i");
   }
-  if (q.jobType) query.jobType = q.jobType;
-  if (q.experience) query.experience = q.experience;
-  if (q.education) query.education = q.education;
-  if (q.language) query.languages = q.language;
+  if (q.jobType) filter.jobType = q.jobType;
+  if (q.experience) filter.experience = q.experience;
+  if (q.education) filter.education = q.education;
+  if (q.language) filter.languages = q.language;
   if (q.skill) {
     const escaped = q.skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    query.skills = new RegExp(escaped, "i");
+    filter.skills = new RegExp(escaped, "i");
   }
   if (q.search) {
     const escaped = q.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    query.$or = [
+    filter.$or = [
       { title: new RegExp(escaped, "i") },
       { description: new RegExp(escaped, "i") },
     ];
   }
-  const jobs = await db.collection("jobs").find(query).sort({ postedDate: -1 }).limit(100).toArray();
+  const jobs = await Job.find(filter).sort({ postedDate: -1 }).limit(100).lean();
   res.json(jobs.map(serializeDoc));
 });
 
 router.get("/jobs/:jobId", async (req, res) => {
   try {
-    const db = getDb();
-    const job = await db.collection("jobs").findOne({ _id: toObjectId(req.params.jobId) });
+    const job = await Job.findById(req.params.jobId).lean();
     if (!job) return res.status(404).json({ detail: "Job not found" });
     res.json(serializeDoc(job));
   } catch (e) {
-    if (e.name === "TypeError") return res.status(400).json({ detail: "Invalid job ID" });
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid job ID" });
     throw e;
   }
 });
 
 router.get("/jobs/employer/:employerId", async (req, res) => {
-  const db = getDb();
   try {
-    const jobs = await db.collection("jobs").find({ employerId: req.params.employerId }).sort({ postedDate: -1 }).limit(100).toArray();
+    const jobs = await Job.find({ employerId: req.params.employerId })
+      .sort({ postedDate: -1 })
+      .limit(100)
+      .lean();
     res.json(jobs.map(serializeDoc));
   } catch (e) {
-    if (e.name === "TypeError") return res.status(400).json({ detail: "Invalid employer ID" });
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid employer ID" });
     throw e;
   }
 });
@@ -146,15 +152,15 @@ router.put("/jobs/:jobId/status", requireEmployer, async (req, res) => {
     return res.status(400).json({ detail: "Valid status required (active, closed, paused)" });
   }
   try {
-    const db = getDb();
-    const r = await db.collection("jobs").updateOne(
-      { _id: toObjectId(req.params.jobId), employerId: req.employerId },
-      { $set: { status } }
+    const job = await Job.findOneAndUpdate(
+      { _id: req.params.jobId, employerId: req.employerId },
+      { $set: { status } },
+      { new: true }
     );
-    if (r.matchedCount === 0) return res.status(404).json({ detail: "Job not found or not owned by you" });
+    if (!job) return res.status(404).json({ detail: "Job not found or not owned by you" });
     res.json({ success: true });
   } catch (e) {
-    if (e.name === "TypeError") return res.status(400).json({ detail: "Invalid job ID" });
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid job ID" });
     throw e;
   }
 });

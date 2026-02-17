@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getDb } from "../config/db.js";
+import { Message, User } from "../models/index.js";
 import { serializeDoc, toObjectId } from "../utils.js";
 import { requireUser } from "../middleware/auth.js";
 
@@ -27,100 +27,125 @@ router.post("/messages", requireUser, async (req, res) => {
     return res.status(400).json({ detail: "Cannot send message to yourself" });
   }
 
-  // Verify receiver exists
-  const db = getDb();
   try {
-    const receiver = await db.collection("users").findOne({ _id: toObjectId(receiverId) });
+    const receiver = await User.findById(receiverId).lean();
     if (!receiver) return res.status(404).json({ detail: "Receiver not found" });
   } catch {
     return res.status(400).json({ detail: "Invalid receiverId" });
   }
 
-  const msg = {
-    receiverId,
-    jobId: jobId || "",
+  const msg = await Message.create({
+    sender: senderId,
+    receiver: receiverId,
+    job: jobId || null,
     message: message.trim(),
-    senderId,
-    timestamp: new Date(),
     read: false,
-  };
-  const r = await db.collection("messages").insertOne(msg);
-  msg.id = r.insertedId.toString();
-  const msgForWs = {
-    id: msg.id,
-    senderId,
-    receiverId,
-    message: msg.message,
-    jobId: msg.jobId,
-    timestamp: msg.timestamp.toISOString(),
-    read: false,
-  };
-  wsSendMessage(receiverId, { type: "new_message", payload: msgForWs });
-  res.json({ ...msg, timestamp: msgForWs.timestamp });
+  });
+
+  const msgJson = msg.toJSON();
+  wsSendMessage(receiverId, { type: "new_message", payload: msgJson });
+  res.json(msgJson);
 });
 
-router.get("/messages/:userId", async (req, res) => {
+router.get("/messages/:userId", requireUser, async (req, res) => {
   const otherUserId = req.query.other_user_id;
   if (!otherUserId) {
     return res.status(400).json({ detail: "other_user_id query param required" });
   }
-  const db = getDb();
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, parseInt(req.query.limit) || 50);
   const skip = (page - 1) * limit;
 
-  const messages = await db.collection("messages")
-    .find({
+  try {
+    const userId = toObjectId(req.params.userId);
+    const otherId = toObjectId(otherUserId);
+
+    const messages = await Message.find({
       $or: [
-        { senderId: req.params.userId, receiverId: otherUserId },
-        { senderId: otherUserId, receiverId: req.params.userId },
+        { sender: userId, receiver: otherId },
+        { sender: otherId, receiver: userId },
       ],
     })
-    .sort({ timestamp: 1 })
-    .skip(skip)
-    .limit(limit)
-    .toArray();
-  res.json(messages.map(serializeDoc));
+      .sort({ createdAt: 1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    res.json(messages.map(serializeDoc));
+  } catch (e) {
+    if (e.name === "TypeError" || e.name === "CastError") {
+      return res.status(400).json({ detail: "Invalid user ID" });
+    }
+    throw e;
+  }
 });
 
-router.get("/messages/conversations/:userId", async (req, res) => {
-  const db = getDb();
-  const pipeline = [
-    { $match: { $or: [{ senderId: req.params.userId }, { receiverId: req.params.userId }] } },
-    { $sort: { timestamp: -1 } },
-    {
-      $group: {
-        _id: { $cond: [{ $eq: ["$senderId", req.params.userId] }, "$receiverId", "$senderId"] },
-        lastMessage: { $first: "$$ROOT" },
+router.put("/messages/mark-read", requireUser, async (req, res) => {
+  const userId = req.userId;
+  const { otherUserId } = req.body;
+  if (!otherUserId) {
+    return res.status(400).json({ detail: "otherUserId is required" });
+  }
+  try {
+    const result = await Message.updateMany(
+      { sender: toObjectId(otherUserId), receiver: toObjectId(userId), read: false },
+      { $set: { read: true } }
+    );
+    // Notify the sender via WebSocket that their messages were read
+    if (result.modifiedCount > 0) {
+      wsSendMessage(otherUserId, { type: "messages_read", payload: { readBy: userId } });
+    }
+    res.json({ updated: result.modifiedCount });
+  } catch (e) {
+    if (e.name === "CastError") {
+      return res.status(400).json({ detail: "Invalid user ID" });
+    }
+    throw e;
+  }
+});
+
+router.get("/messages/conversations/:userId", requireUser, async (req, res) => {
+  try {
+    const userId = toObjectId(req.params.userId);
+
+    const pipeline = [
+      { $match: { $or: [{ sender: userId }, { receiver: userId }] } },
+      { $sort: { createdAt: -1 } },
+      {
+        $group: {
+          _id: { $cond: [{ $eq: ["$sender", userId] }, "$receiver", "$sender"] },
+          lastMessage: { $first: "$$ROOT" },
+        },
       },
-    },
-    { $limit: 50 },
-  ];
-  const convs = await db.collection("messages").aggregate(pipeline).toArray();
+      { $limit: 50 },
+    ];
+    const convs = await Message.aggregate(pipeline);
 
-  // Batch-fetch all user docs instead of N+1
-  const userIds = convs.map((c) => {
-    try { return toObjectId(c._id); } catch { return null; }
-  }).filter(Boolean);
+    const userIds = convs.map(c => c._id).filter(Boolean);
+    const users = userIds.length
+      ? await User.find({ _id: { $in: userIds } }).lean()
+      : [];
+    const userMap = new Map(users.map(u => [u._id.toString(), u]));
 
-  const users = userIds.length
-    ? await db.collection("users").find({ _id: { $in: userIds } }).toArray()
-    : [];
-  const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+    const result = convs
+      .map(c => {
+        const other = userMap.get(c._id.toString());
+        if (!other) return null;
+        return {
+          userId: c._id.toString(),
+          userName: other.name,
+          lastMessage: serializeDoc(c.lastMessage),
+        };
+      })
+      .filter(Boolean);
 
-  const result = convs
-    .map((c) => {
-      const other = userMap.get(c._id);
-      if (!other) return null;
-      return {
-        userId: c._id,
-        userName: other.name,
-        lastMessage: serializeDoc(c.lastMessage),
-      };
-    })
-    .filter(Boolean);
-
-  res.json(result);
+    res.json(result);
+  } catch (e) {
+    if (e.name === "TypeError" || e.name === "CastError") {
+      return res.status(400).json({ detail: "Invalid user ID" });
+    }
+    throw e;
+  }
 });
 
 export default router;

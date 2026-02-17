@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { getDb } from "../config/db.js";
-import { serializeDoc, toObjectId } from "../utils.js";
+import { Application, Job } from "../models/index.js";
+import { serializeDoc } from "../utils.js";
 import { requireSeeker, requireEmployer } from "../middleware/auth.js";
 
 const router = Router();
@@ -10,65 +10,67 @@ router.post("/applications", requireSeeker, async (req, res) => {
   const seeker = req.seeker;
   const { jobId, coverLetter } = req.body;
 
-  // Validate jobId
   if (!jobId) {
     return res.status(400).json({ detail: "jobId is required" });
   }
-  try {
-    toObjectId(jobId);
-  } catch {
-    return res.status(400).json({ detail: "Invalid jobId format" });
-  }
-
-  // Validate coverLetter length
   if (coverLetter && coverLetter.length > 2000) {
     return res.status(400).json({ detail: "Cover letter too long (max 2000 characters)" });
   }
 
-  const db = getDb();
+  try {
+    const job = await Job.findById(jobId);
+    if (!job) return res.status(404).json({ detail: "Job not found" });
+    if (job.status !== "active") return res.status(400).json({ detail: "Job is no longer accepting applications" });
 
-  // Verify job exists and is active
-  const job = await db.collection("jobs").findOne({ _id: toObjectId(jobId) });
-  if (!job) return res.status(404).json({ detail: "Job not found" });
-  if (job.status !== "active") return res.status(400).json({ detail: "Job is no longer accepting applications" });
+    const existing = await Application.findOne({ job: jobId, seeker: seekerId });
+    if (existing) return res.status(400).json({ detail: "Already applied to this job" });
 
-  const existing = await db.collection("applications").findOne({ jobId, seekerId });
-  if (existing) return res.status(400).json({ detail: "Already applied to this job" });
+    const application = await Application.create({
+      job: jobId,
+      seeker: seekerId,
+      seekerName: seeker.name,
+      seekerPhone: seeker.phone,
+      seekerSkills: seeker.skills || [],
+      coverLetter: coverLetter || "",
+      status: "pending",
+      appliedDate: new Date(),
+    });
 
-  const app = {
-    jobId,
-    coverLetter: coverLetter || "",
-    seekerId,
-    seekerName: seeker.name,
-    seekerPhone: seeker.phone,
-    seekerSkills: seeker.skills || [],
-    status: "pending",
-    appliedDate: new Date(),
-  };
-  const r = await db.collection("applications").insertOne(app);
-  app.id = r.insertedId.toString();
-  await db.collection("jobs").updateOne(
-    { _id: toObjectId(jobId) },
-    { $inc: { applicationsCount: 1 } }
-  );
-  res.json(app);
+    job.applicationsCount = (job.applicationsCount || 0) + 1;
+    await job.save();
+
+    res.json(application.toJSON());
+  } catch (e) {
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid jobId format" });
+    if (e.code === 11000) return res.status(400).json({ detail: "Already applied to this job" });
+    throw e;
+  }
 });
 
 router.get("/applications/job/:jobId", async (req, res) => {
   try {
-    toObjectId(req.params.jobId);
-  } catch {
-    return res.status(400).json({ detail: "Invalid jobId format" });
+    const apps = await Application.find({ job: req.params.jobId })
+      .sort({ appliedDate: -1 })
+      .limit(100)
+      .lean();
+    res.json(apps.map(serializeDoc));
+  } catch (e) {
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid jobId format" });
+    throw e;
   }
-  const db = getDb();
-  const apps = await db.collection("applications").find({ jobId: req.params.jobId }).sort({ appliedDate: -1 }).limit(100).toArray();
-  res.json(apps.map(serializeDoc));
 });
 
 router.get("/applications/seeker/:seekerId", async (req, res) => {
-  const db = getDb();
-  const apps = await db.collection("applications").find({ seekerId: req.params.seekerId }).sort({ appliedDate: -1 }).limit(100).toArray();
-  res.json(apps.map(serializeDoc));
+  try {
+    const apps = await Application.find({ seeker: req.params.seekerId })
+      .sort({ appliedDate: -1 })
+      .limit(100)
+      .lean();
+    res.json(apps.map(serializeDoc));
+  } catch (e) {
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid seekerId format" });
+    throw e;
+  }
 });
 
 router.put("/applications/:appId/status", requireEmployer, async (req, res) => {
@@ -76,22 +78,19 @@ router.put("/applications/:appId/status", requireEmployer, async (req, res) => {
   if (!status || !["shortlisted", "rejected", "hired"].includes(status)) {
     return res.status(400).json({ detail: "Valid status required (shortlisted, rejected, hired)" });
   }
-  const employerId = req.employerId;
-  const db = getDb();
   try {
-    const app = await db.collection("applications").findOne({ _id: toObjectId(req.params.appId) });
+    const app = await Application.findById(req.params.appId);
     if (!app) return res.status(404).json({ detail: "Application not found" });
-    const job = await db.collection("jobs").findOne({ _id: toObjectId(app.jobId) });
-    if (!job || job.employerId !== employerId) {
+
+    const job = await Job.findById(app.job);
+    if (!job || job.employerId !== req.employerId) {
       return res.status(403).json({ detail: "Only the job employer can update application status" });
     }
-    await db.collection("applications").updateOne(
-      { _id: toObjectId(req.params.appId) },
-      { $set: { status } }
-    );
+    app.status = status;
+    await app.save();
     res.json({ success: true });
   } catch (e) {
-    if (e.name === "TypeError") return res.status(400).json({ detail: "Invalid application ID" });
+    if (e.name === "CastError") return res.status(400).json({ detail: "Invalid application ID" });
     throw e;
   }
 });

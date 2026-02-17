@@ -1,6 +1,5 @@
 import { Router } from "express";
-import { getDb } from "../config/db.js";
-import { toObjectId } from "../utils.js";
+import { User, Transaction } from "../models/index.js";
 import { requireEmployer } from "../middleware/auth.js";
 
 const router = Router();
@@ -19,19 +18,18 @@ router.post("/payments/create-order", (req, res) => {
 router.post("/payments/verify", requireEmployer, async (req, res) => {
   const employerId = req.employerId;
   const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
-  const db = getDb();
-  await db.collection("users").updateOne(
-    { _id: toObjectId(employerId) },
-    { $inc: { freeJobsRemaining: 1 } }
-  );
-  await db.collection("transactions").insertOne({
-    employerId,
+
+  await User.findByIdAndUpdate(employerId, { $inc: { freeJobsRemaining: 1 } });
+
+  await Transaction.create({
+    employer: employerId,
     amount: 5000,
-    razorpayOrderId,
-    razorpayPaymentId,
+    razorpayOrderId: razorpayOrderId || "",
+    razorpayPaymentId: razorpayPaymentId || "",
+    razorpaySignature: razorpaySignature || "",
     status: "success",
-    createdAt: new Date(),
   });
+
   res.json({ success: true, message: "Payment verified" });
 });
 

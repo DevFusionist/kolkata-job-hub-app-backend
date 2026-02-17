@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import logger from "../lib/logger.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_AVAILABLE = !!process.env.OPENAI_API_KEY;
@@ -11,7 +12,7 @@ function getClient() {
     client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     return client;
   } catch (e) {
-    console.warn("OpenAI init failed:", e.message);
+    logger.warn({ err: e.message }, "OpenAI init failed");
     return null;
   }
 }
@@ -42,7 +43,7 @@ async function chatJson(system, userContent) {
     const raw = (r.choices[0]?.message?.content || "").trim();
     return raw ? parseJsonFromResponse(raw) : null;
   } catch (e) {
-    console.warn("OpenAI chat failed:", e.message);
+    logger.warn({ err: e.message }, "OpenAI chat failed");
     return null;
   }
 }

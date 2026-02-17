@@ -1,9 +1,33 @@
 import jwt from "jsonwebtoken";
-import { getDb } from "../config/db.js";
-import { toObjectId } from "../utils.js";
+import { User } from "../models/index.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "kolkata-job-hub-fallback-secret";
 const JWT_EXPIRES_IN = "30d";
+
+// In-memory TTL cache for User lookups to avoid DB hit on every request
+const USER_CACHE_TTL_MS = 60_000; // 60 seconds
+const userCache = new Map(); // userId -> { user, expiresAt }
+
+function getCachedUser(userId) {
+  const entry = userCache.get(userId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    userCache.delete(userId);
+    return null;
+  }
+  return entry.user;
+}
+
+function setCachedUser(userId, user) {
+  userCache.set(userId, { user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+  // Evict stale entries periodically (keep cache bounded)
+  if (userCache.size > 5000) {
+    const now = Date.now();
+    for (const [key, val] of userCache) {
+      if (now > val.expiresAt) userCache.delete(key);
+    }
+  }
+}
 
 /**
  * Generate a JWT for a user.
@@ -20,30 +44,31 @@ export function generateToken(user) {
 /**
  * Express middleware: verifies JWT from Authorization header.
  * Sets req.userId, req.userRole, and req.user (full doc from DB).
- * Falls back to legacy query-param auth if no token present (backward compat).
+ * If no token present, silently passes through (requireUser etc. will reject).
  */
 export async function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    // Backward compat: fall through to legacy auth middleware
     return next();
   }
 
   const token = authHeader.split(" ")[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const db = getDb();
-    const user = await db
-      .collection("users")
-      .findOne({ _id: toObjectId(decoded.userId) });
+    // Try cache first
+    let user = getCachedUser(decoded.userId);
     if (!user) {
-      return res.status(401).json({ detail: "User not found" });
+      user = await User.findById(decoded.userId).lean();
+      if (!user) {
+        return res.status(401).json({ detail: "User not found" });
+      }
+      setCachedUser(decoded.userId, user);
     }
+
     req.userId = user._id.toString();
     req.userRole = user.role;
     req.user = user;
 
-    // Also set req.seeker / req.employer for compatibility with existing middleware
     if (user.role === "seeker") {
       req.seeker = user;
       req.seekerId = req.userId;

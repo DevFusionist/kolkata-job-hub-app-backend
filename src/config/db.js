@@ -1,27 +1,21 @@
-import { MongoClient } from "mongodb";
+import mongoose from "mongoose";
+import logger from "../lib/logger.js";
 
 const url = process.env.MONGO_URL;
 const dbName = process.env.DB_NAME;
 
-let client;
-let db;
-
 export async function connectDb() {
-  if (db) return db;
-  client = new MongoClient(url);
-  await client.connect();
-  db = client.db(dbName);
-  return db;
+  if (mongoose.connection.readyState >= 1) return mongoose.connection.db;
+  const fullUrl = url.includes(dbName) ? url : `${url.replace(/\/[^/]*$/, "/")}${dbName}`;
+  await mongoose.connect(fullUrl, { dbName });
+  logger.info({ dbName }, "MongoDB connected");
+  return mongoose.connection.db;
 }
 
 export function getDb() {
-  return db;
+  return mongoose.connection.db;
 }
 
 export async function closeDb() {
-  if (client) {
-    await client.close();
-    client = null;
-    db = null;
-  }
+  await mongoose.disconnect();
 }
