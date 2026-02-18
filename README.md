@@ -18,6 +18,12 @@ MPIN_SALT=your-salt
 PORT=8000
 ```
 
+**Twilio (Phone OTP):** For send/verify OTP via SMS, set in `.env`:
+
+- `TWILIO_ACCOUNT_SID` – from Twilio Console  
+- `TWILIO_AUTH_TOKEN` – from Twilio Console  
+- `TWILIO_VERIFY_SID` – Verify service SID (Dashboard → Verify → Create Service)  
+
 ## Run
 
 ```bash
@@ -27,8 +33,8 @@ npm run dev     # dev with watch
 
 ## API
 
-- `POST /api/auth/send-otp` - Mock OTP
-- `POST /api/auth/verify-otp` - Verify phone
+- `POST /api/auth/send-otp` - Send OTP via Twilio Verify (body: `{ phone }`)
+- `POST /api/auth/verify-otp` - Verify OTP (body: `{ phone, otp }`); returns user/token or isNewUser
 - `POST /api/auth/login` - Login with MPIN
 - `POST /api/auth/set-mpin` - Set MPIN
 - `POST /api/users` - Create user

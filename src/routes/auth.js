@@ -2,28 +2,42 @@ import { Router } from "express";
 import { User } from "../models/index.js";
 import { hashMpin, serializeDoc } from "../utils.js";
 import { generateToken } from "../middleware/jwt.js";
+import { sendOtp as twilioSendOtp, verifyOtp as twilioVerifyOtp } from "../lib/twilio.js";
 
 const router = Router();
+
+function toE164(phone) {
+  const digits = String(phone).replace(/\D/g, "").slice(-10);
+  return digits.length === 10 ? `+91${digits}` : null;
+}
 
 router.post("/auth/send-otp", async (req, res) => {
   const { phone } = req.body;
   if (!phone || !/^\d{10}$/.test(phone)) {
     return res.status(400).json({ success: false, message: "Invalid phone number" });
   }
-    const user  = await User.findOne({phone}).lean();
-      if(user){
-        return res.status(409).json({success:false, message:"Phone number is already registered, try to sign in using mpin instead"});
-      }
-  res.json({ success: true, message: "OTP sent. Use 123456 for testing." });
+  const e164 = toE164(phone);
+  const result = await twilioSendOtp(e164);
+  if (!result.success) {
+    return res
+      .status(502)
+      .json({ success: false, message: result.message || "Failed to send OTP" });
+  }
+  res.json({ success: true, message: "OTP sent to your number." });
 });
 
 router.post("/auth/verify-otp", async (req, res) => {
   const { phone, otp } = req.body;
+  if (!phone || !/^\d{10}$/.test(phone)) {
+    return res.status(400).json({ success: false, message: "Invalid phone number" });
+  }
   if (!otp || otp.length !== 6) {
     return res.status(400).json({ success: false, message: "Invalid OTP" });
   }
-  if (otp !== "123456") {
-    return res.status(401).json({ success: false, message: "Incorrect OTP" });
+  const e164 = toE164(phone);
+  const result = await twilioVerifyOtp(e164, otp);
+  if (!result.success) {
+    return res.status(401).json({ success: false, message: result.message || "Incorrect or expired OTP" });
   }
   const user = await User.findOne({ phone }).lean();
   if (user) {
