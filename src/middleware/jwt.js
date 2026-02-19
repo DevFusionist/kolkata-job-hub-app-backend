@@ -1,8 +1,13 @@
 import jwt from "jsonwebtoken";
 import { User } from "../models/index.js";
 
-const JWT_SECRET = process.env.JWT_SECRET || "kolkata-job-hub-fallback-secret";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET environment variable is required");
+}
 const JWT_EXPIRES_IN = "30d";
+const REGISTRATION_TOKEN_EXPIRES_IN = "15m";
+const MPIN_RESET_TOKEN_EXPIRES_IN = "10m";
 
 // In-memory TTL cache for User lookups to avoid DB hit on every request
 const USER_CACHE_TTL_MS = 60_000; // 60 seconds
@@ -29,6 +34,15 @@ function setCachedUser(userId, user) {
   }
 }
 
+export function invalidateUserCache(userId) {
+  if (!userId) return;
+  userCache.delete(String(userId));
+}
+
+export function clearUserCache() {
+  userCache.clear();
+}
+
 /**
  * Generate a JWT for a user.
  * @param {{ id: string, phone: string, role: string }} user
@@ -40,6 +54,45 @@ export function generateToken(user) {
     { expiresIn: JWT_EXPIRES_IN }
   );
 }
+
+export function generateRegistrationToken(phone) {
+  return jwt.sign(
+    { purpose: "register", phone: String(phone || "") },
+    JWT_SECRET,
+    { expiresIn: REGISTRATION_TOKEN_EXPIRES_IN }
+  );
+}
+
+export function verifyRegistrationToken(token) {
+  const decoded = jwt.verify(String(token || ""), JWT_SECRET);
+  if (!decoded || decoded.purpose !== "register" || !/^\d{10}$/.test(String(decoded.phone || ""))) {
+    throw new Error("Invalid registration token");
+  }
+  return decoded;
+}
+
+export function generateMpinResetToken(user) {
+  return jwt.sign(
+    { purpose: "reset_mpin", userId: String(user.id || user._id), phone: String(user.phone || "") },
+    JWT_SECRET,
+    { expiresIn: MPIN_RESET_TOKEN_EXPIRES_IN }
+  );
+}
+
+export function verifyMpinResetToken(token) {
+  const decoded = jwt.verify(String(token || ""), JWT_SECRET);
+  if (
+    !decoded
+    || decoded.purpose !== "reset_mpin"
+    || !/^[a-f\d]{24}$/i.test(String(decoded.userId || ""))
+    || !/^\d{10}$/.test(String(decoded.phone || ""))
+  ) {
+    throw new Error("Invalid MPIN reset token");
+  }
+  return decoded;
+}
+
+export { JWT_SECRET };
 
 /**
  * Express middleware: verifies JWT from Authorization header.

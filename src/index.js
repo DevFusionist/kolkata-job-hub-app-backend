@@ -8,7 +8,7 @@ import mongoose from "mongoose";
 import { connectDb, closeDb } from "./config/db.js";
 import { setWsSendMessage } from "./routes/messages.js";
 import { requestLogger } from "./middleware/requestLogger.js";
-import { verifyToken } from "./middleware/jwt.js";
+import { verifyToken, JWT_SECRET } from "./middleware/jwt.js";
 import { sanitizeInput } from "./middleware/sanitize.js";
 import logger from "./lib/logger.js";
 import authRoutes from "./routes/auth.js";
@@ -21,8 +21,6 @@ import messageRoutes from "./routes/messages.js";
 import paymentRoutes from "./routes/payments.js";
 import { WebSocketServer } from "ws";
 import jwt from "jsonwebtoken";
-
-const JWT_SECRET = process.env.JWT_SECRET || "kolkata-job-hub-fallback-secret";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -123,7 +121,11 @@ app.use((req, res) => res.status(404).json({ detail: "Not found" }));
 // Global error handler
 app.use((err, req, res, _next) => {
   logger.error({ err, method: req.method, url: req.originalUrl }, "Unhandled error");
-  res.status(500).json({ detail: err.message || "Internal server error" });
+  const status = Number(err?.status || err?.statusCode) || 500;
+  if (status >= 500) {
+    return res.status(500).json({ detail: "Internal server error" });
+  }
+  return res.status(status).json({ detail: err.message || "Request failed" });
 });
 
 const server = app.listen(PORT, async () => {
@@ -146,29 +148,27 @@ server.on("upgrade", (req, socket, head) => {
   const token = urlObj.searchParams.get("token");
   const requestedUserId = pathname.replace(/^\/ws\/?/, "").split("/")[0];
 
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded.userId !== requestedUserId) {
-        logger.warn({ tokenUserId: decoded.userId, urlUserId: requestedUserId }, "WS auth mismatch");
-        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-      req._authenticatedUserId = decoded.userId;
-    } catch {
-      logger.warn("WS auth failed: invalid token");
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+  if (!token) {
+    logger.warn("WS auth failed: missing token");
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.userId !== requestedUserId) {
+      logger.warn({ tokenUserId: decoded.userId, urlUserId: requestedUserId }, "WS auth mismatch");
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
     }
-  } else {
-    if (process.env.NODE_ENV === "production") {
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    req._authenticatedUserId = requestedUserId;
+    req._authenticatedUserId = decoded.userId;
+  } catch {
+    logger.warn("WS auth failed: invalid token");
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {

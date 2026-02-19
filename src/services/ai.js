@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import logger from "../lib/logger.js";
+import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_AVAILABLE = !!process.env.OPENAI_API_KEY;
@@ -27,18 +28,24 @@ function parseJsonFromResponse(raw) {
   }
 }
 
-async function chatJson(system, userContent) {
+async function chatJson(system, userContent, opts = {}) {
   const c = getClient();
   if (!c) return null;
   try {
+    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+    const prompt = truncateAiInput(`${system}\n\n${userContent}`);
+    const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
+    if (!budget.ok) return null;
+
     const r = await c.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: userContent },
+        { role: "user", content: truncateAiInput(userContent) },
       ],
       temperature: 0.3,
       response_format: { type: "json_object" },
+      max_tokens: maxTokens,
     });
     const raw = (r.choices[0]?.message?.content || "").trim();
     return raw ? parseJsonFromResponse(raw) : null;
@@ -48,7 +55,7 @@ async function chatJson(system, userContent) {
   }
 }
 
-export async function analyzePortfolio(rawText, projects = [], links = []) {
+export async function analyzePortfolio(rawText, projects = [], links = [], opts = {}) {
   const defaultOut = {
     skills: [],
     experience: "Fresher",
@@ -68,7 +75,7 @@ export async function analyzePortfolio(rawText, projects = [], links = []) {
 4. score: 0-100 talent score based on clarity, skills, experience
 5. feedback: 1-2 sentence improvement tips (skill gap, what to add). Be encouraging. In English.
 Output ONLY valid JSON with keys: skills, experience, category, score, feedback.`;
-  const data = await chatJson(system, `${content}\nReturn JSON only:`);
+  const data = await chatJson(system, `${content}\nReturn JSON only:`, { userId: opts.userId, maxTokens: 220 });
   if (!data) return defaultOut;
   let skills = data.skills || [];
   if (typeof skills === "string") skills = skills.split(",").map((s) => s.trim()).filter(Boolean);
@@ -82,7 +89,7 @@ Output ONLY valid JSON with keys: skills, experience, category, score, feedback.
   };
 }
 
-export async function generateJobFromText(text, employerLocation) {
+export async function generateJobFromText(text, employerLocation, opts = {}) {
   const defaultOut = {
     title: "",
     category: "Other",
@@ -102,7 +109,7 @@ Output ONLY valid JSON with: title, category, description, salary, location, job
 Categories: Sales, Delivery, Retail, Hospitality, Office Work, Driver, Warehouse, Restaurant, Security, Other.
 If location missing, use Kolkata. Salary format: ₹X,000 - ₹Y,000/month. Keep description concise.`;
   const prompt = `Employer text: "${text}"\nDefault location: ${employerLocation || "Kolkata"}\nReturn JSON only:`;
-  const data = await chatJson(system, prompt);
+  const data = await chatJson(system, prompt, { userId: opts.userId, maxTokens: 220 });
   if (!data) return defaultOut;
   let skills = data.skills || [];
   if (typeof skills === "string") skills = skills.split(",").map((s) => s.trim()).filter(Boolean);
@@ -123,7 +130,7 @@ If location missing, use Kolkata. Salary format: ₹X,000 - ₹Y,000/month. Keep
   };
 }
 
-export async function rankJobsForSeeker(seeker, jobs, topN = 10) {
+export async function rankJobsForSeeker(seeker, jobs, topN = 10, opts = {}) {
   if (!OPENAI_AVAILABLE || !jobs?.length) {
     return jobs.slice(0, topN).map((j) => String(j.id ?? j._id ?? ""));
   }
@@ -151,7 +158,10 @@ Jobs (rank these by fit):
 ${JSON.stringify(jobsSummary, null, 2)}
 
 Return JSON with ranked_ids in best-to-worst match order:`;
-  const data = await chatJson(system, userContent);
+  const data = await chatJson(system, userContent, {
+    userId: opts.userId || seeker?._id?.toString?.() || seeker?.id,
+    maxTokens: 220,
+  });
   if (!data?.ranked_ids) {
     return jobs.slice(0, topN).map((j) => String(j.id ?? j._id ?? ""));
   }
@@ -164,7 +174,7 @@ Return JSON with ranked_ids in best-to-worst match order:`;
   return ranked.slice(0, topN);
 }
 
-export async function rankCandidatesForJob(job, candidates, topN = 10) {
+export async function rankCandidatesForJob(job, candidates, topN = 10, opts = {}) {
   if (!OPENAI_AVAILABLE || !candidates?.length) {
     return candidates.slice(0, topN).map((c) => String(c.id ?? c._id ?? ""));
   }
@@ -188,7 +198,10 @@ Candidates (rank these by fit):
 ${JSON.stringify(candSummary, null, 2)}
 
 Return JSON with ranked_ids in best-to-worst fit order:`;
-  const data = await chatJson(system, userContent);
+  const data = await chatJson(system, userContent, {
+    userId: opts.userId || job?.employerId,
+    maxTokens: 220,
+  });
   if (!data?.ranked_ids) {
     return candidates.slice(0, topN).map((c) => String(c.id ?? c._id ?? ""));
   }

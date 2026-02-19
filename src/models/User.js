@@ -35,6 +35,19 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    paidJobsRemaining: {
+      type: Number,
+      default: 0,
+    },
+    subscriptionPlan: {
+      type: String,
+      enum: ["none", "monthly_unlimited"],
+      default: "none",
+    },
+    subscriptionExpiresAt: {
+      type: Date,
+      default: null,
+    },
     location: {
       type: String,
       trim: true,

@@ -5,6 +5,11 @@ const xssOptions = {
   stripIgnoreTag: true,
   stripIgnoreTagBody: ["script"],
 };
+const BLOCKED_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+function isUnsafeKey(key) {
+  return key.startsWith("$") || key.includes(".") || BLOCKED_KEYS.has(key);
+}
 
 function sanitizeValue(val) {
   if (typeof val === "string") {
@@ -22,6 +27,7 @@ function sanitizeValue(val) {
 function sanitizeObject(obj) {
   const cleaned = {};
   for (const [key, val] of Object.entries(obj)) {
+    if (isUnsafeKey(key)) continue;
     cleaned[key] = sanitizeValue(val);
   }
   return cleaned;

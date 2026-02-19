@@ -12,17 +12,41 @@ const transactionSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    purchaseType: {
+      type: String,
+      enum: ["credit", "subscription"],
+      default: "credit",
+      index: true,
+    },
+    itemCode: {
+      type: String,
+      default: "single_job",
+      index: true,
+    },
+    creditsPurchased: {
+      type: Number,
+      default: 0,
+    },
+    subscriptionPlan: {
+      type: String,
+      enum: ["none", "monthly_unlimited"],
+      default: "none",
+    },
+    subscriptionDays: {
+      type: Number,
+      default: 0,
+    },
     currency: {
       type: String,
       default: "INR",
     },
-    razorpayOrderId: { type: String, default: "" },
-    razorpayPaymentId: { type: String, default: "" },
-    razorpaySignature: { type: String, default: "" },
+    razorpayOrderId: { type: String, index: true },
+    razorpayPaymentId: { type: String },
+    razorpaySignature: { type: String },
     status: {
       type: String,
       enum: ["created", "success", "failed", "refunded"],
-      default: "success",
+      default: "created",
     },
   },
   {
@@ -39,6 +63,15 @@ const transactionSchema = new mongoose.Schema(
     },
     toObject: { virtuals: true },
   }
+);
+
+transactionSchema.index(
+  { employer: 1, razorpayOrderId: 1 },
+  { unique: true, partialFilterExpression: { razorpayOrderId: { $type: "string" } } }
+);
+transactionSchema.index(
+  { razorpayPaymentId: 1 },
+  { unique: true, partialFilterExpression: { razorpayPaymentId: { $type: "string" } } }
 );
 
 export default mongoose.model("Transaction", transactionSchema);

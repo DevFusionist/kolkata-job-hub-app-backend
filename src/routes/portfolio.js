@@ -3,6 +3,7 @@ import multer from "multer";
 import { Portfolio, User } from "../models/index.js";
 import { serializeDoc } from "../utils.js";
 import { requireSeeker } from "../middleware/auth.js";
+import { invalidateUserCache } from "../middleware/jwt.js";
 import { analyzePortfolio } from "../services/ai.js";
 import { uploadFile, getPresignedUrl, r2Configured } from "../lib/r2.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
@@ -15,6 +16,8 @@ import {
 import logger from "../lib/logger.js";
 
 const router = Router();
+const MAX_OVERRIDE_TEXT = 500;
+const MAX_OVERRIDE_ARRAY = 30;
 
 // Multer config: memory storage, 5MB limit, PDF/DOC/DOCX only
 const upload = multer({
@@ -34,7 +37,10 @@ const upload = multer({
   },
 });
 
-router.get("/portfolios/seeker/:seekerId", async (req, res) => {
+router.get("/portfolios/seeker/:seekerId", requireSeeker, async (req, res) => {
+  if (req.params.seekerId !== req.seekerId) {
+    return res.status(403).json({ detail: "You can only view your own portfolio" });
+  }
   try {
     const portfolio = await Portfolio.findOne({ seeker: req.params.seekerId })
       .sort({ createdAt: -1 })
@@ -133,7 +139,7 @@ router.post(
     let aiResult = null;
     if (extractedText.trim().length > 10) {
       try {
-        aiResult = await analyzePortfolio(extractedText, [], []);
+        aiResult = await analyzePortfolio(extractedText, [], [], { userId: seekerId });
       } catch (e) {
         logger.warn({ err: e.message }, "AI portfolio analysis failed during upload");
       }
@@ -176,6 +182,7 @@ router.post(
           score: aiResult.score,
         };
         await user.save();
+        invalidateUserCache(seekerId);
       }
     }
 
@@ -205,7 +212,7 @@ router.post(
     const seekerId = req.seekerId;
 
     // Allow user to provide overrides for resume data
-    const overrides = req.body || {};
+    const overrides = req.body && typeof req.body === "object" ? req.body : {};
 
     logger.info({ seekerId }, "Building AI resume");
 
@@ -213,16 +220,20 @@ router.post(
     const resumeData = await buildResumeData(seekerId);
 
     // Apply user overrides (from the builder form)
-    if (overrides.name) resumeData.name = overrides.name;
-    if (overrides.phone) resumeData.phone = overrides.phone;
-    if (overrides.location) resumeData.location = overrides.location;
-    if (overrides.skills?.length) resumeData.skills = overrides.skills;
-    if (overrides.experience) resumeData.experience = overrides.experience;
-    if (overrides.languages?.length) resumeData.languages = overrides.languages;
-    if (overrides.portfolioText) resumeData.portfolioText = overrides.portfolioText;
+    if (overrides.name) resumeData.name = String(overrides.name).slice(0, MAX_OVERRIDE_TEXT);
+    if (overrides.phone) resumeData.phone = String(overrides.phone).slice(0, 20);
+    if (overrides.location) resumeData.location = String(overrides.location).slice(0, MAX_OVERRIDE_TEXT);
+    if (Array.isArray(overrides.skills) && overrides.skills.length) {
+      resumeData.skills = overrides.skills.slice(0, MAX_OVERRIDE_ARRAY).map((s) => String(s || "").slice(0, 60));
+    }
+    if (overrides.experience) resumeData.experience = String(overrides.experience).slice(0, 40);
+    if (Array.isArray(overrides.languages) && overrides.languages.length) {
+      resumeData.languages = overrides.languages.slice(0, MAX_OVERRIDE_ARRAY).map((l) => String(l || "").slice(0, 40));
+    }
+    if (overrides.portfolioText) resumeData.portfolioText = String(overrides.portfolioText).slice(0, 4000);
 
     // 2. Generate resume with AI
-    const resumeJson = await generateResumeWithAI(resumeData);
+    const resumeJson = await generateResumeWithAI(resumeData, { userId: seekerId });
 
     // 3. Render to PDF
     const { html, pdf } = await renderResumePDF(resumeJson);

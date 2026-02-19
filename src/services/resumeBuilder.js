@@ -10,6 +10,7 @@
 import OpenAI from "openai";
 import { User, Portfolio, Application, Job } from "../models/index.js";
 import { uploadFile } from "../lib/r2.js";
+import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
 import logger from "../lib/logger.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -74,7 +75,7 @@ export async function buildResumeData(userId) {
 /**
  * Step 2: Generate resume content using AI (structured JSON output).
  */
-export async function generateResumeWithAI(resumeData) {
+export async function generateResumeWithAI(resumeData, opts = {}) {
   const client = getClient();
 
   const systemPrompt = `You are a professional resume writer specializing in ATS-optimized resumes for the Indian job market (Kolkata area).
@@ -131,14 +132,22 @@ Generate a professional, ATS-friendly resume JSON:`;
   }
 
   try {
+    const maxTokens = clampAiOutputTokens(420, 420);
+    const promptText = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+    const budget = enforceAiBudget({ userId: opts.userId, promptText, maxOutputTokens: maxTokens });
+    if (!budget.ok) {
+      logger.warn({ userId: opts.userId, reason: budget.reason }, "AI resume budget exceeded, using fallback");
+      return buildFallbackResume(resumeData);
+    }
+
     const response = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "system", content: truncateAiInput(systemPrompt) },
+        { role: "user", content: truncateAiInput(userPrompt) },
       ],
       temperature: 0.3,
-      max_tokens: 1000,
+      max_tokens: maxTokens,
       response_format: { type: "json_object" },
     });
 

@@ -22,7 +22,10 @@ import {
   CATEGORIES, JOB_TYPES, EXPERIENCE_LEVELS,
 } from "../models/index.js";
 import { serializeDoc, toObjectId } from "../utils.js";
+import { invalidateUserCache } from "../middleware/jwt.js";
 import { rankJobsForSeeker, rankCandidatesForJob } from "./ai.js";
+import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
+import { reserveJobPostingQuota, rollbackJobPostingQuota } from "../lib/employerEntitlements.js";
 import logger from "../lib/logger.js";
 
 /* ──────────────────── Constants ──────────────────── */
@@ -58,15 +61,20 @@ async function aiJson(systemPrompt, userPrompt, opts = {}) {
   const client = getClient();
   if (!client) return null;
   try {
+    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+    const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+    const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
+    if (!budget.ok) return null;
+
     const r = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "system", content: truncateAiInput(systemPrompt) },
+        { role: "user", content: truncateAiInput(userPrompt) },
       ],
       temperature: opts.temperature ?? 0.2,
       response_format: { type: "json_object" },
-      max_tokens: opts.maxTokens ?? 300,
+      max_tokens: maxTokens,
     });
     return parseJson(r.choices[0]?.message?.content || "");
   } catch (e) {
@@ -79,14 +87,19 @@ async function aiText(systemPrompt, userPrompt, opts = {}) {
   const client = getClient();
   if (!client) return null;
   try {
+    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+    const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+    const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
+    if (!budget.ok) return null;
+
     const r = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "system", content: truncateAiInput(systemPrompt) },
+        { role: "user", content: truncateAiInput(userPrompt) },
       ],
       temperature: opts.temperature ?? 0.5,
-      max_tokens: opts.maxTokens ?? 400,
+      max_tokens: maxTokens,
     });
     return (r.choices[0]?.message?.content || "").trim();
   } catch (e) {
@@ -223,7 +236,7 @@ Return ONLY valid JSON:
 
 Do NOT generate any user-facing text. Only structured JSON.`;
 
-async function stage1_classifyIntent(userMessage, userProfile, conversationHistory) {
+async function stage1_classifyIntent(userId, userMessage, userProfile, conversationHistory) {
   const profileCtx = `User profile: skills=${JSON.stringify(userProfile.skills)}, experience=${userProfile.experience}, location=${userProfile.location}, salary_pref=${JSON.stringify(userProfile.preferredSalary)}`;
   const historyCtx = conversationHistory.slice(-6).map((m) => `${m.role}: ${m.content}`).join("\n");
 
@@ -236,7 +249,7 @@ Current message: "${userMessage}"
 
 Return JSON:`;
 
-  const result = await aiJson(INTENT_SYSTEM, userPrompt);
+  const result = await aiJson(INTENT_SYSTEM, userPrompt, { userId, maxTokens: 180 });
   return result || { intent: "general", filters: {}, apply_target: null, raw_search: userMessage };
 }
 
@@ -307,7 +320,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
       .limit(dbLimit)
       .lean();
     for (const j of jobsRaw) j.id = j._id.toString();
-    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit);
+    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
     return rankedIds.map((id) => idToJob[id]).filter(Boolean);
   }
@@ -331,7 +344,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     }
     const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
-    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit);
+    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
     return rankedIds.map((id) => idToJob[id]).filter(Boolean);
   }
@@ -352,7 +365,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     if (orConditions.length) query.$or = orConditions;
     const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
-    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit);
+    const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
     return rankedIds.map((id) => idToJob[id]).filter(Boolean);
   }
@@ -414,7 +427,9 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
   if (!jobsRaw.length) return [];
 
   for (const j of jobsRaw) j.id = j._id.toString();
-  const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit);
+  const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, {
+    userId: user?._id?.toString?.() || user?.id,
+  });
   const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
   return rankedIds.map((id) => idToJob[id]).filter(Boolean);
 }
@@ -451,7 +466,9 @@ async function executeFindCandidates(user) {
 
   for (const s of seekers) s.id = s._id.toString();
   const topJob = employerJobs[0];
-  const rankedIds = await rankCandidatesForJob(topJob, seekers, 10);
+  const rankedIds = await rankCandidatesForJob(topJob, seekers, 10, {
+    userId: user?._id?.toString?.() || user?.id,
+  });
   const idMap = Object.fromEntries(seekers.map(s => [s.id, s]));
   const ranked = rankedIds.map(id => idMap[id]).filter(Boolean);
 
@@ -486,7 +503,7 @@ Format job results beautifully for the user. Rules:
 - When user has salary preferences, mention if results match their range.`;
 
 async function stage2_formatResponse(intent, results, context) {
-  const { userProfile, searchType, filters, applyResult, userMessage, similarJobsAfterApply } = context;
+  const { userId, userProfile, searchType, filters, applyResult, userMessage, similarJobsAfterApply } = context;
 
   let userPrompt = "";
 
@@ -541,7 +558,7 @@ ${userProfile?.previousAppsCount > 0 ? `They've applied to ${userProfile.previou
 Write a helpful, warm response. If they seem to want jobs, suggest using the quick actions or typing a job category. 1-3 sentences max.`;
   }
 
-  const formatted = await aiText(FORMAT_SYSTEM, userPrompt, { temperature: 0.6, maxTokens: 250 });
+  const formatted = await aiText(FORMAT_SYSTEM, userPrompt, { userId, temperature: 0.6, maxTokens: 180 });
   return formatted;
 }
 
@@ -752,14 +769,11 @@ async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
 
   const confirmWords = /yes|হ্যাঁ|হাঁ|ok|post|করুন|korum|confirm|ঠিক আছে/i;
   if (step === "confirm" && confirmWords.test(lastContent)) {
-    const employer = await User.findById(userId);
+    const employer = await User.findById(userId).lean();
     if (!employer || employer.role !== "employer") {
       return { message: "Only employers can post jobs.", action: "error" };
     }
-    const remaining = Number.isFinite(employer?.freeJobsRemaining) ? employer.freeJobsRemaining : 0;
-    if (remaining <= 0) {
-      return { message: "Apnar free job post sesh. Payment required.", action: "payment_required" };
-    }
+
     const { errors, cat, jt, ex, desc } = validateJobDraft(updatedDraft);
     if (errors.length) {
       return { message: `Job details invalid: ${errors.join(", ")}`, action: "error" };
@@ -774,32 +788,43 @@ async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
     });
     if (recentDup) return { message: "You just posted a similar job moments ago.", action: "error" };
 
+    const reservation = await reserveJobPostingQuota(userId);
+    if (!reservation.ok) {
+      return { message: "Apnar free job post sesh. Payment required.", action: "payment_required" };
+    }
+    const employerWithCredit = reservation.user;
+
     const { salaryMin, salaryMax } = parseSalaryRange(updatedDraft.salary);
-
-    const job = await Job.create({
-      title,
-      category: cat,
-      description: desc || "See requirements.",
-      salary: updatedDraft.salary,
-      salaryMin,
-      salaryMax,
-      location: updatedDraft.location,
-      jobType: jt || "Full-time",
-      experience: ex || "Fresher",
-      education: "Any",
-      languages: ["Bengali", "Hindi", "English"],
-      skills: [cat],
-      employerId: userId,
-      employerName: employer.name,
-      employerPhone: employer.phone,
-      businessName: employer.businessName,
-      postedDate: new Date(),
-      status: "active",
-      applicationsCount: 0,
-    });
-
-    employer.freeJobsRemaining -= 1;
-    await employer.save();
+    let job;
+    try {
+      job = await Job.create({
+        title,
+        category: cat,
+        description: desc || "See requirements.",
+        salary: updatedDraft.salary,
+        salaryMin,
+        salaryMax,
+        location: updatedDraft.location,
+        jobType: jt || "Full-time",
+        experience: ex || "Fresher",
+        education: "Any",
+        languages: ["Bengali", "Hindi", "English"],
+        skills: [cat],
+        employerId: userId,
+        employerName: employerWithCredit.name,
+        employerPhone: employerWithCredit.phone,
+        businessName: employerWithCredit.businessName,
+        postedDate: new Date(),
+        status: "active",
+        applicationsCount: 0,
+        isPaid: reservation.source !== "free",
+      });
+    } catch (e) {
+      await rollbackJobPostingQuota(userId, reservation.source);
+      invalidateUserCache(userId);
+      throw e;
+    }
+    invalidateUserCache(userId);
 
     // Clear the draft from session
     if (session) await updateSessionMemory(session, { jobDraft: null });
@@ -881,6 +906,12 @@ function sanitizeContextJobs(lastJobs) {
     .filter(Boolean);
 }
 
+function sanitizeJobForClient(job) {
+  const out = serializeDoc(job);
+  delete out.employerPhone;
+  return out;
+}
+
 /* ──────────────────── MAIN ENTRY POINT ──────────────────── */
 
 export async function handleProtibhaChat(userId, role, messages, jobDraft = null, context = {}) {
@@ -930,7 +961,10 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
           return { message: candResult.message, action: "message" };
         }
         const formatted = await stage2_formatResponse("candidates", [], {
-          userProfile: null, candidateResult: candResult, userMessage: lastContent,
+          userId,
+          userProfile: null,
+          candidateResult: candResult,
+          userMessage: lastContent,
         });
         const msg = formatted || `${candResult.candidates.length} jon matching candidate peyechi apnar jobs er jonno!`;
         await appendSessionMessage(session, "assistant", msg, "show_candidates");
@@ -944,7 +978,7 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
         const tips = await aiText(
           "You are Protibha, a job posting expert for Kolkata businesses. Give 3-4 short, actionable tips for writing better job posts that attract more candidates. Use Banglish (Bengali + English mix). Be warm and practical.",
           `Employer: ${user.name}, business: ${user.businessName || "N/A"}, location: ${user.location || "Kolkata"}`,
-          { temperature: 0.6, maxTokens: 300 },
+          { userId, temperature: 0.6, maxTokens: 180 },
         );
         const msg = tips || "Good job posts e clear title, salary range, ar location dile candidates beshi apply kore!";
         await appendSessionMessage(session, "assistant", msg, "message");
@@ -961,9 +995,13 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
 
   // Helper to build response and persist
   async function buildSearchResponse(jobs, searchType, filters) {
-    const serialized = jobs.map(serializeDoc);
+    const serialized = jobs.map(sanitizeJobForClient);
     const formatted = await stage2_formatResponse("search", serialized, {
-      userProfile, searchType, filters, userMessage: lastContent,
+      userId,
+      userProfile,
+      searchType,
+      filters,
+      userMessage: lastContent,
     });
     const msg = formatted || fallbackSearchMessage(serialized, filters);
 
@@ -1007,19 +1045,19 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
   let applyTarget = null;
 
   if (intent === "search") {
-    const stage1 = await stage1_classifyIntent(lastContent, userProfile, messages);
+    const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
     filters = stage1.filters || {};
     if (stage1.intent === "apply") {
       intent = "apply";
       applyTarget = stage1.apply_target;
     }
   } else if (intent === "apply") {
-    const stage1 = await stage1_classifyIntent(lastContent, userProfile, messages);
+    const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
     applyTarget = stage1.apply_target || lastContent;
   } else if (intent === "similar") {
     // Use similar search directly
   } else {
-    const stage1 = await stage1_classifyIntent(lastContent, userProfile, messages);
+    const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
     intent = stage1.intent || "general";
     filters = stage1.filters || {};
     applyTarget = stage1.apply_target || null;
@@ -1034,9 +1072,13 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
 
   if (intent === "similar") {
     const jobs = await executeJobSearch(user, {}, "similar", userProfile);
-    const serialized = jobs.map(serializeDoc);
+    const serialized = jobs.map(sanitizeJobForClient);
     const formatted = await stage2_formatResponse("similar", serialized, {
-      userProfile, searchType: "similar", filters: {}, userMessage: lastContent,
+      userId,
+      userProfile,
+      searchType: "similar",
+      filters: {},
+      userMessage: lastContent,
     });
     const msg = formatted || (serialized.length
       ? `${serialized.length} ti similar job peyechi!`
@@ -1071,12 +1113,15 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
         // Refresh profile (new application added)
         const freshProfile = await buildUserProfile(user);
         similarJobs = (await executeJobSearch(user, {}, "similar", freshProfile, { rankLimit: 5 }))
-          .map(serializeDoc);
+          .map(sanitizeJobForClient);
       } catch { /* ignore */ }
     }
 
     const formatted = await stage2_formatResponse("apply", [], {
-      userProfile, applyResult: result, userMessage: lastContent,
+      userId,
+      userProfile,
+      applyResult: result,
+      userMessage: lastContent,
       similarJobsAfterApply: similarJobs,
     });
 
@@ -1096,7 +1141,7 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       action: "apply_success",
       payload: {
         applied: result.applied,
-        jobs: result.appliedJobs.map(serializeDoc),
+        jobs: result.appliedJobs.map(sanitizeJobForClient),
         similarJobs,
       },
     };
@@ -1104,7 +1149,9 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
 
   // ─── GENERAL / FALLBACK ───
   const generalReply = await stage2_formatResponse("general", [], {
-    userProfile, userMessage: lastContent,
+    userId,
+    userProfile,
+    userMessage: lastContent,
   });
 
   const msg = generalReply || "Ami bujhte parlam na. Jobs khujte \"delivery jobs\" ba \"find jobs\" bolen! 🔍";

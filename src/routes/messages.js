@@ -48,6 +48,9 @@ router.post("/messages", requireUser, async (req, res) => {
 });
 
 router.get("/messages/:userId", requireUser, async (req, res) => {
+  if (req.params.userId !== req.userId) {
+    return res.status(403).json({ detail: "You can only view your own messages" });
+  }
   const otherUserId = req.query.other_user_id;
   if (!otherUserId) {
     return res.status(400).json({ detail: "other_user_id query param required" });
@@ -105,6 +108,9 @@ router.put("/messages/mark-read", requireUser, async (req, res) => {
 });
 
 router.get("/messages/conversations/:userId", requireUser, async (req, res) => {
+  if (req.params.userId !== req.userId) {
+    return res.status(403).json({ detail: "You can only view your own conversations" });
+  }
   try {
     const userId = toObjectId(req.params.userId);
 

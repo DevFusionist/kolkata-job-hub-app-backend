@@ -6,7 +6,17 @@ import logger from "../lib/logger.js";
  * Note: Only the LOG output is sanitized (mpin/password etc show as [REDACTED]).
  * req.body is never modified – route handlers still receive the real values.
  */
-const SENSITIVE_KEYS = new Set(["mpin", "mpinhash", "password", "otp", "token", "apikey", "api_key"]);
+const SENSITIVE_KEYS = new Set([
+  "mpin",
+  "mpinhash",
+  "password",
+  "otp",
+  "token",
+  "registrationtoken",
+  "mpinresettoken",
+  "apikey",
+  "api_key",
+]);
 const TRUNCATE_KEYS = new Set(["audiobase64", "audio_base64"]);
 const MAX_BODY_LOG = 500;
 const MAX_TRUNCATED = 80;

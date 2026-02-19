@@ -1,6 +1,11 @@
 import crypto from "crypto";
 import mongoose from "mongoose";
 
+const MPIN_SALT = process.env.MPIN_SALT;
+if (!MPIN_SALT) {
+  throw new Error("MPIN_SALT environment variable is required");
+}
+
 /** Create a mongoose ObjectId from hex string. Throws TypeError if invalid. */
 export function toObjectId(id) {
   if (id instanceof mongoose.Types.ObjectId) return id;
@@ -15,8 +20,7 @@ export function toObjectId(id) {
  * will need to reset their MPIN. See migration notes.
  */
 export function hashMpin(mpin) {
-  const salt = process.env.MPIN_SALT || "kolkata-job-hub-mpin-salt";
-  return crypto.pbkdf2Sync(mpin, salt, 100000, 64, "sha512").toString("hex");
+  return crypto.pbkdf2Sync(String(mpin || ""), MPIN_SALT, 100000, 64, "sha512").toString("hex");
 }
 
 /**

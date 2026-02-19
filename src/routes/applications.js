@@ -47,8 +47,14 @@ router.post("/applications", requireSeeker, async (req, res) => {
   }
 });
 
-router.get("/applications/job/:jobId", async (req, res) => {
+router.get("/applications/job/:jobId", requireEmployer, async (req, res) => {
   try {
+    const job = await Job.findById(req.params.jobId).lean();
+    if (!job) return res.status(404).json({ detail: "Job not found" });
+    if (job.employerId !== req.employerId) {
+      return res.status(403).json({ detail: "You can only view applications for your own jobs" });
+    }
+
     const apps = await Application.find({ job: req.params.jobId })
       .sort({ appliedDate: -1 })
       .limit(100)
@@ -60,7 +66,10 @@ router.get("/applications/job/:jobId", async (req, res) => {
   }
 });
 
-router.get("/applications/seeker/:seekerId", async (req, res) => {
+router.get("/applications/seeker/:seekerId", requireSeeker, async (req, res) => {
+  if (req.params.seekerId !== req.seekerId) {
+    return res.status(403).json({ detail: "You can only view your own applications" });
+  }
   try {
     const apps = await Application.find({ seeker: req.params.seekerId })
       .sort({ appliedDate: -1 })

@@ -2,12 +2,57 @@ import { Router } from "express";
 import { User, Job, Portfolio, ChatSession } from "../models/index.js";
 import { serializeDoc } from "../utils.js";
 import { requireSeeker, requireUser } from "../middleware/auth.js";
+import { invalidateUserCache } from "../middleware/jwt.js";
 import { analyzePortfolio, rankJobsForSeeker, rankCandidatesForJob } from "../services/ai.js";
 import { handleProtibhaChat } from "../services/protibhaChat.js";
 import logger from "../lib/logger.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
 
 const router = Router();
+const MAX_CHAT_MESSAGES = 40;
+const MAX_CHAT_MESSAGE_CHARS = 500;
+const MAX_JOB_DRAFT_FIELD_CHARS = 300;
+const MAX_LAST_JOBS = 30;
+const MAX_PORTFOLIO_TEXT = 8000;
+const MAX_PROJECTS = 20;
+const MAX_LINKS = 20;
+const MAX_LINK_CHARS = 200;
+const MAX_PROJECT_FIELD_CHARS = 200;
+
+function sanitizeJob(job) {
+  const out = serializeDoc(job);
+  delete out.employerPhone;
+  return out;
+}
+
+function sanitizeChatMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .slice(-MAX_CHAT_MESSAGES)
+    .map((m) => ({
+      role: m?.role === "assistant" ? "assistant" : "user",
+      content: String(m?.content || "").slice(0, MAX_CHAT_MESSAGE_CHARS).trim(),
+    }))
+    .filter((m) => m.content.length > 0);
+}
+
+function sanitizeJobDraft(jobDraft) {
+  if (!jobDraft || typeof jobDraft !== "object") return null;
+  const fields = ["category", "location", "salary", "jobType", "experience", "description"];
+  const out = {};
+  for (const f of fields) {
+    if (jobDraft[f] !== undefined) out[f] = String(jobDraft[f] || "").slice(0, MAX_JOB_DRAFT_FIELD_CHARS);
+  }
+  return out;
+}
+
+function sanitizeLastJobs(lastJobs) {
+  if (!Array.isArray(lastJobs)) return [];
+  return lastJobs
+    .slice(0, MAX_LAST_JOBS)
+    .map((j) => (typeof j?.id === "string" ? { id: j.id } : typeof j?._id === "string" ? { id: j._id } : null))
+    .filter(Boolean);
+}
 
 /**
  * Protibha chat – 2-stage AI assistant.
@@ -21,11 +66,9 @@ const router = Router();
 router.post("/ai/chat", requireUser, async (req, res) => {
   const userId = req.userId;
   const user = req.user;
-  const {
-    messages = [],
-    jobDraft = null,
-    lastJobs = [],
-  } = req.body;
+  const messages = sanitizeChatMessages(req.body?.messages);
+  const jobDraft = sanitizeJobDraft(req.body?.jobDraft);
+  const lastJobs = sanitizeLastJobs(req.body?.lastJobs);
 
   try {
     const result = await handleProtibhaChat(userId, user.role, messages, jobDraft, {
@@ -44,8 +87,21 @@ router.post("/ai/chat", requireUser, async (req, res) => {
 router.post("/ai/analyze-portfolio", requireSeeker, async (req, res) => {
   const seekerId = req.seekerId;
   const user = req.seeker;
-  const { rawText, projects = [], links = [] } = req.body;
-  const result = await analyzePortfolio(rawText, projects, links);
+  const rawText = String(req.body?.rawText || "").slice(0, MAX_PORTFOLIO_TEXT);
+  const projects = Array.isArray(req.body?.projects)
+    ? req.body.projects
+      .slice(0, MAX_PROJECTS)
+      .map((p) => String(p || "").slice(0, MAX_PROJECT_FIELD_CHARS))
+      .filter(Boolean)
+    : [];
+  const links = Array.isArray(req.body?.links)
+    ? req.body.links
+      .slice(0, MAX_LINKS)
+      .map((l) => String(l || "").slice(0, MAX_LINK_CHARS))
+      .filter(Boolean)
+    : [];
+
+  const result = await analyzePortfolio(rawText, projects, links, { userId: seekerId });
   const aiExtracted = {
     skills: result.skills,
     experience: result.experience,
@@ -67,6 +123,7 @@ router.post("/ai/analyze-portfolio", requireSeeker, async (req, res) => {
   await User.findByIdAndUpdate(seekerId, {
     $set: { aiExtracted, skills: [...existingSkills].slice(0, 30) },
   });
+  invalidateUserCache(seekerId);
 
   res.json({
     skills: result.skills,
@@ -148,9 +205,13 @@ router.post("/ai/match", requireUser, asyncHandler(async (req, res) => {
   const { seekerId, jobId, limit = 5 } = req.body;
   if (seekerId && jobId) return res.status(400).json({ detail: "Provide seekerId or jobId, not both" });
   if (!seekerId && !jobId) return res.status(400).json({ detail: "Provide seekerId or jobId" });
-  const lim = Math.min(limit || 10, 20);
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 20);
 
   if (seekerId) {
+    if (req.userRole !== "seeker" || req.userId !== seekerId) {
+      return res.status(403).json({ detail: "You can only request matches for your own seeker profile" });
+    }
+
     const seeker = await User.findById(seekerId).lean();
     if (!seeker || seeker.role !== "seeker") return res.json({ jobs: [] });
     const skills = seeker.skills || [];
@@ -170,14 +231,17 @@ router.post("/ai/match", requireUser, asyncHandler(async (req, res) => {
     const jobsRaw = await Job.find(query).sort({ postedDate: -1 }).limit(30).lean();
     if (!jobsRaw.length) return res.json({ jobs: [] });
     for (const j of jobsRaw) j.id = j._id.toString();
-    const rankedIds = await rankJobsForSeeker(seeker, jobsRaw, lim);
+    const rankedIds = await rankJobsForSeeker(seeker, jobsRaw, lim, { userId: req.userId });
     const idToJob = Object.fromEntries(jobsRaw.map(j => [j._id.toString(), j]));
     const jobsOrdered = rankedIds.map(id => idToJob[id]).filter(Boolean);
-    return res.json({ jobs: jobsOrdered.map(serializeDoc) });
+    return res.json({ jobs: jobsOrdered.map(sanitizeJob) });
   }
 
   const job = await Job.findById(jobId).lean();
   if (!job) return res.status(404).json({ detail: "Job not found" });
+  if (req.userRole !== "employer" || job.employerId !== req.userId) {
+    return res.status(403).json({ detail: "You can only request candidates for your own jobs" });
+  }
   const jobSkills = job.skills || [];
   const query = { role: "seeker" };
   if (jobSkills.length) {
@@ -189,7 +253,7 @@ router.post("/ai/match", requireUser, asyncHandler(async (req, res) => {
   const seekersRaw = await User.find(query).limit(30).lean();
   if (!seekersRaw.length) return res.json({ candidates: [] });
   for (const s of seekersRaw) s.id = s._id.toString();
-  const rankedIds = await rankCandidatesForJob(job, seekersRaw, lim);
+  const rankedIds = await rankCandidatesForJob(job, seekersRaw, lim, { userId: req.userId });
   const idToSeeker = Object.fromEntries(seekersRaw.map(s => [s._id.toString(), s]));
   const seekersOrdered = rankedIds.map(id => idToSeeker[id]).filter(Boolean);
   res.json({ candidates: seekersOrdered.map(serializeDoc) });
