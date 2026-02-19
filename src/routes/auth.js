@@ -1,5 +1,5 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { User } from "../models/index.js";
 import { hashMpin, serializeDoc } from "../utils.js";
 import {
@@ -30,7 +30,7 @@ function parseOtpPurpose(raw) {
 
 function phoneAwareKey(req) {
   const phone = String(req.body?.phone || "").replace(/\D/g, "").slice(-10) || "unknown";
-  return `${req.ip}:${phone}`;
+  return `${ipKeyGenerator(req.ip)}:${phone}`;
 }
 
 const sendOtpLimiter = rateLimit({
@@ -57,7 +57,7 @@ const loginLimiter = rateLimit({
 const setMpinLimiter = rateLimit({
   windowMs: OTP_WINDOW_MS,
   max: 8,
-  keyGenerator: (req) => `${req.ip}:${String(req.userId || req.headers["x-mpin-reset-token"] || "unknown")}`,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip)}:${String(req.userId || req.headers["x-mpin-reset-token"] || "unknown")}`,
   message: { detail: "Too many MPIN reset attempts. Please try again later." },
 });
 
