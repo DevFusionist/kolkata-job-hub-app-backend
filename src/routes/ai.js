@@ -102,6 +102,13 @@ router.post("/ai/analyze-portfolio", requireSeeker, async (req, res) => {
     : [];
 
   const result = await analyzePortfolio(rawText, projects, links, { userId: seekerId });
+  if (result.paymentRequired) {
+    return res.status(402).json({
+      message: "AI credits exhausted. Please purchase more to use this feature.",
+      action: "payment_required",
+      detail: "Payment required",
+    });
+  }
   const aiExtracted = {
     skills: result.skills,
     experience: result.experience,
@@ -232,6 +239,13 @@ router.post("/ai/match", requireUser, asyncHandler(async (req, res) => {
     if (!jobsRaw.length) return res.json({ jobs: [] });
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(seeker, jobsRaw, lim, { userId: req.userId });
+    if (rankedIds && rankedIds.paymentRequired) {
+      return res.status(402).json({
+        message: "AI credits exhausted. Please purchase more to use AI matching.",
+        action: "payment_required",
+        detail: "Payment required",
+      });
+    }
     const idToJob = Object.fromEntries(jobsRaw.map(j => [j._id.toString(), j]));
     const jobsOrdered = rankedIds.map(id => idToJob[id]).filter(Boolean);
     return res.json({ jobs: jobsOrdered.map(sanitizeJob) });
@@ -254,6 +268,13 @@ router.post("/ai/match", requireUser, asyncHandler(async (req, res) => {
   if (!seekersRaw.length) return res.json({ candidates: [] });
   for (const s of seekersRaw) s.id = s._id.toString();
   const rankedIds = await rankCandidatesForJob(job, seekersRaw, lim, { userId: req.userId });
+  if (rankedIds && rankedIds.paymentRequired) {
+    return res.status(402).json({
+      message: "AI credits exhausted. Please purchase more to use AI matching.",
+      action: "payment_required",
+      detail: "Payment required",
+    });
+  }
   const idToSeeker = Object.fromEntries(seekersRaw.map(s => [s._id.toString(), s]));
   const seekersOrdered = rankedIds.map(id => idToSeeker[id]).filter(Boolean);
   res.json({ candidates: seekersOrdered.map(serializeDoc) });

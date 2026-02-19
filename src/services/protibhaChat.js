@@ -26,6 +26,7 @@ import { invalidateUserCache } from "../middleware/jwt.js";
 import { rankJobsForSeeker, rankCandidatesForJob } from "./ai.js";
 import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
 import { reserveJobPostingQuota, rollbackJobPostingQuota } from "../lib/employerEntitlements.js";
+import { reserveAiCredits, rollbackAiCredits } from "../lib/aiCredits.js";
 import logger from "../lib/logger.js";
 
 /* ──────────────────── Constants ──────────────────── */
@@ -39,6 +40,11 @@ const MIN_DESCRIPTION_LEN = 8;
 const DB_LIMIT = 30;
 const RANK_LIMIT = 10;
 const MAX_SESSION_MESSAGES = 200;
+
+// User-facing messages: all in English for consistency (no mixed Hindi/Bengali).
+const MSG_AI_CREDITS_EXHAUSTED = "Your AI credits are used up. Please buy more to continue using AI.";
+const MSG_AI_CREDITS_TRY_AGAIN = "Your AI credits are used up. Please buy more to try again.";
+const MSG_JOB_POST_PAYMENT_REQUIRED = "Your free job posts are used up. Payment required.";
 
 /* ──────────────────── OpenAI helpers ──────────────────── */
 
@@ -57,15 +63,26 @@ function parseJson(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+function estimateTokensForCall(promptText, maxOutputTokens) {
+  return Math.ceil(String(promptText || "").length / 4) + Math.max(1, parseInt(maxOutputTokens, 10) || 200);
+}
+
 async function aiJson(systemPrompt, userPrompt, opts = {}) {
   const client = getClient();
-  if (!client) return null;
+  if (!client) return { result: null, paymentRequired: false };
+  const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+  const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+  const estimated = estimateTokensForCall(prompt, maxTokens);
+  const reservation = await reserveAiCredits(opts.userId, estimated);
+  if (!reservation.ok) {
+    return { result: null, paymentRequired: true };
+  }
   try {
-    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
-    const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
     const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
-    if (!budget.ok) return null;
-
+    if (!budget.ok) {
+      await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+      return { result: null, paymentRequired: false };
+    }
     const r = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
@@ -76,22 +93,31 @@ async function aiJson(systemPrompt, userPrompt, opts = {}) {
       response_format: { type: "json_object" },
       max_tokens: maxTokens,
     });
-    return parseJson(r.choices[0]?.message?.content || "");
+    const parsed = parseJson(r.choices[0]?.message?.content || "");
+    return { result: parsed, paymentRequired: false };
   } catch (e) {
     logger.error({ err: e.message }, "AI JSON call failed");
-    return null;
+    await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    return { result: null, paymentRequired: false };
   }
 }
 
 async function aiText(systemPrompt, userPrompt, opts = {}) {
   const client = getClient();
-  if (!client) return null;
+  if (!client) return { result: null, paymentRequired: false };
+  const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+  const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+  const estimated = estimateTokensForCall(prompt, maxTokens);
+  const reservation = await reserveAiCredits(opts.userId, estimated);
+  if (!reservation.ok) {
+    return { result: null, paymentRequired: true };
+  }
   try {
-    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
-    const prompt = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
     const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
-    if (!budget.ok) return null;
-
+    if (!budget.ok) {
+      await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+      return { result: null, paymentRequired: false };
+    }
     const r = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
@@ -101,10 +127,12 @@ async function aiText(systemPrompt, userPrompt, opts = {}) {
       temperature: opts.temperature ?? 0.5,
       max_tokens: maxTokens,
     });
-    return (r.choices[0]?.message?.content || "").trim();
+    const text = (r.choices[0]?.message?.content || "").trim();
+    return { result: text, paymentRequired: false };
   } catch (e) {
     logger.error({ err: e.message }, "AI text call failed");
-    return null;
+    await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    return { result: null, paymentRequired: false };
   }
 }
 
@@ -249,8 +277,9 @@ Current message: "${userMessage}"
 
 Return JSON:`;
 
-  const result = await aiJson(INTENT_SYSTEM, userPrompt, { userId, maxTokens: 180 });
-  return result || { intent: "general", filters: {}, apply_target: null, raw_search: userMessage };
+  const { result, paymentRequired } = await aiJson(INTENT_SYSTEM, userPrompt, { userId, maxTokens: 180 });
+  if (paymentRequired) return { intentResult: null, paymentRequired: true };
+  return { intentResult: result || { intent: "general", filters: {}, apply_target: null, raw_search: userMessage }, paymentRequired: false };
 }
 
 /* ──────────────────── Quick Action routing (no AI needed) ──────────────────── */
@@ -321,8 +350,9 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
       .lean();
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
+    if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
-    return rankedIds.map((id) => idToJob[id]).filter(Boolean);
+    return { jobs: rankedIds.map((id) => idToJob[id]).filter(Boolean), paymentRequired: false };
   }
 
   // Skills match: match user skills + portfolio skills
@@ -345,8 +375,9 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
+    if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
-    return rankedIds.map((id) => idToJob[id]).filter(Boolean);
+    return { jobs: rankedIds.map((id) => idToJob[id]).filter(Boolean), paymentRequired: false };
   }
 
   // Similar jobs (based on last applied/shown categories and locations)
@@ -366,8 +397,9 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
+    if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
     const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
-    return rankedIds.map((id) => idToJob[id]).filter(Boolean);
+    return { jobs: rankedIds.map((id) => idToJob[id]).filter(Boolean), paymentRequired: false };
   }
 
   // Regular search with filters from AI
@@ -424,14 +456,15 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     jobsRaw = await Job.find(relaxed).sort(sort).limit(dbLimit).lean();
   }
 
-  if (!jobsRaw.length) return [];
+  if (!jobsRaw.length) return { jobs: [], paymentRequired: false };
 
   for (const j of jobsRaw) j.id = j._id.toString();
   const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, {
     userId: user?._id?.toString?.() || user?.id,
   });
+  if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
   const idToJob = Object.fromEntries(jobsRaw.map((j) => [j.id, j]));
-  return rankedIds.map((id) => idToJob[id]).filter(Boolean);
+  return { jobs: rankedIds.map((id) => idToJob[id]).filter(Boolean), paymentRequired: false };
 }
 
 /* ──────────────────── Employer: Find Candidates ──────────────────── */
@@ -441,7 +474,7 @@ async function executeFindCandidates(user) {
     .sort({ postedDate: -1 }).limit(5).lean();
 
   if (!employerJobs.length) {
-    return { candidates: [], message: "Apnar kono active job nai. Age ekta job post korun!" };
+    return { candidates: [], message: "You have no active jobs. Please post a job first!" };
   }
 
   const allJobSkills = [...new Set(employerJobs.flatMap(j => j.skills || []))];
@@ -461,7 +494,7 @@ async function executeFindCandidates(user) {
 
   const seekers = await User.find(seekerQuery).limit(30).lean();
   if (!seekers.length) {
-    return { candidates: [], message: "Ekhon kono matching candidate paini. Tara jokohn register korbe, dekhte paben." };
+    return { candidates: [], message: "No matching candidates right now. You'll see them when they register." };
   }
 
   for (const s of seekers) s.id = s._id.toString();
@@ -469,6 +502,9 @@ async function executeFindCandidates(user) {
   const rankedIds = await rankCandidatesForJob(topJob, seekers, 10, {
     userId: user?._id?.toString?.() || user?.id,
   });
+  if (rankedIds && rankedIds.paymentRequired) {
+    return { paymentRequired: true, candidates: [], message: MSG_AI_CREDITS_EXHAUSTED };
+  }
   const idMap = Object.fromEntries(seekers.map(s => [s.id, s]));
   const ranked = rankedIds.map(id => idMap[id]).filter(Boolean);
 
@@ -487,10 +523,11 @@ async function executeFindCandidates(user) {
 
 /* ──────────────────── STAGE 2: Format response (AI Call 2) ──────────────────── */
 
-const FORMAT_SYSTEM = `You are Protibha, a warm Bengali-English job assistant for Kolkata Job Hub.
+const FORMAT_SYSTEM = `You are Protibha, a warm job assistant for Kolkata Job Hub.
 
-Format job results beautifully for the user. Rules:
-- Use a mix of English and Bengali (Banglish) naturally.
+Language: You must reply in English only. Every word of your response must be in English. Do not use Bengali, Hindi, or any mixed language (no Banglish). This is required.
+
+Format job results for the user. Rules:
 - Use emojis sparingly but effectively.
 - Show each job as a numbered card with: title, location, salary, business name.
 - If no jobs found, be encouraging and suggest trying different keywords or "recent jobs".
@@ -534,7 +571,7 @@ ${jobCount > 0 ? `Top results:\n${jobSummary}` : "No matching jobs found."}
 
 User's profile: skills=${JSON.stringify(userProfile?.skills || [])}, location=${userProfile?.location || "N/A"}${salaryCtx}${prevAppsCtx}
 
-Write a SHORT (1-2 sentences) intro message. The job cards will be shown separately by the UI, so do NOT list the jobs again. Just say how many you found and a brief context.`;
+Write a SHORT (1-2 sentences) intro message in English only. The job cards will be shown separately by the UI, so do NOT list the jobs again. Just say how many you found and a brief context.`;
   } else if (intent === "apply") {
     const { applied, alreadyApplied, failed, jobTitles } = applyResult;
     const hasSimilar = similarJobsAfterApply?.length > 0;
@@ -542,24 +579,25 @@ Write a SHORT (1-2 sentences) intro message. The job cards will be shown separat
 Jobs: ${jobTitles.join(", ")}
 ${hasSimilar ? `\n${similarJobsAfterApply.length} similar jobs available.` : ""}
 
-Write a SHORT (1-2 sentences) confirmation. Be warm and encouraging. Mention the employer will contact them if applied successfully.${hasSimilar ? " Mention that similar jobs are shown below." : " Ask if they want similar jobs."}`;
+Write a SHORT (1-2 sentences) confirmation in English only. Be warm and encouraging. Mention the employer will contact them if applied successfully.${hasSimilar ? " Mention that similar jobs are shown below." : " Ask if they want similar jobs."}`;
   } else if (intent === "candidates") {
     const { candidates, jobTitles } = context.candidateResult;
     userPrompt = `Employer searched for candidates for their jobs: ${jobTitles?.join(", ") || "their posted jobs"}.
 Found ${candidates.length} matching candidates.
 ${candidates.slice(0, 5).map((c, i) => `${i + 1}. ${c.name} – skills: ${c.skills?.join(", ")} – ${c.location}`).join("\n")}
 
-Write a SHORT (1-2 sentences) intro. Candidate cards are shown separately by the UI.`;
+Write a SHORT (1-2 sentences) intro in English only. Candidate cards are shown separately by the UI.`;
   } else {
     userPrompt = `User said: "${userMessage}"
 User profile: skills=${JSON.stringify(userProfile?.skills || [])}, location=${userProfile?.location || "N/A"}
 ${userProfile?.previousAppsCount > 0 ? `They've applied to ${userProfile.previousAppsCount} jobs before.` : "They haven't applied to any jobs yet."}
 
-Write a helpful, warm response. If they seem to want jobs, suggest using the quick actions or typing a job category. 1-3 sentences max.`;
+Write a helpful, warm response in English only. If they seem to want jobs, suggest using the quick actions or typing a job category. 1-3 sentences max.`;
   }
 
-  const formatted = await aiText(FORMAT_SYSTEM, userPrompt, { userId, temperature: 0.6, maxTokens: 180 });
-  return formatted;
+  const { result: formatted, paymentRequired } = await aiText(FORMAT_SYSTEM, userPrompt, { userId, temperature: 0.6, maxTokens: 180 });
+  if (paymentRequired) return { formatted: null, paymentRequired: true };
+  return { formatted: formatted || "", paymentRequired: false };
 }
 
 /* ──────────────────── Apply flow (Mongoose) ──────────────────── */
@@ -790,7 +828,7 @@ async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
 
     const reservation = await reserveJobPostingQuota(userId);
     if (!reservation.ok) {
-      return { message: "Apnar free job post sesh. Payment required.", action: "payment_required" };
+      return { message: MSG_JOB_POST_PAYMENT_REQUIRED, action: "payment_required" };
     }
     const employerWithCredit = reservation.user;
 
@@ -831,7 +869,7 @@ async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
 
     const jobJson = job.toJSON();
     return {
-      message: `🎉 Job posted! "${title}" post kore diyechi. Candidates apply korte parbe.`,
+      message: `🎉 Job posted! "${title}" is live. Candidates can apply now.`,
       action: "post_job_success",
       payload: { jobId: jobJson.id, job: jobJson },
     };
@@ -842,13 +880,13 @@ async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
 
   const nextStep = getNextJobStep(updatedDraft);
   const prompts = {
-    category: "Ki rokom job post korben? (e.g. Beautician, Sales, Delivery, Retail)",
-    location: "📍 Kothay location hobe? (e.g. Garia, Park Street, Salt Lake)",
-    salary: "💰 Salary range koto? (e.g. ₹10,000 - ₹15,000/month)",
-    jobType: "Full-time na Part-time?",
+    category: "What kind of job do you want to post? (e.g. Beautician, Sales, Delivery, Retail)",
+    location: "📍 Where is the location? (e.g. Garia, Park Street, Salt Lake)",
+    salary: "💰 What is the salary range? (e.g. ₹10,000 - ₹15,000/month)",
+    jobType: "Full-time or Part-time?",
     experience: "Experience level? (Fresher, 1-2 years, 3-5 years, 5+ years)",
-    description: "Kichhu extra bolun description er jonno. (Optional - 'skip' bolte paren)",
-    confirm: `📋 Your job: ${updatedDraft.category} at ${updatedDraft.location}, ${updatedDraft.salary}. Post korbo?`,
+    description: "Add a short description. (Optional – say 'skip' to skip)",
+    confirm: `📋 Your job: ${updatedDraft.category} at ${updatedDraft.location}, ${updatedDraft.salary}. Post it?`,
   };
   return {
     message: prompts[nextStep],
@@ -880,17 +918,17 @@ function detectLocalIntent(text) {
 
 function fallbackSearchMessage(jobs, filters) {
   const desc = filters?.role || filters?.location || "search";
-  if (!jobs.length) return `"${desc}" diye kono job khuje paini. Onno keyword try koren!`;
-  return `${jobs.length} ti job peyechi${filters?.role ? ` "${filters.role}"` : ""}${filters?.location ? ` in ${filters.location}` : ""}. Ekhane dekhen:`;
+  if (!jobs.length) return `No jobs found for "${desc}". Try different keywords.`;
+  return `Found ${jobs.length} job(s)${filters?.role ? ` for "${filters.role}"` : ""}${filters?.location ? ` in ${filters.location}` : ""}. See below:`;
 }
 
 function fallbackApplyMessage(result) {
   if (result.applied > 0 && result.alreadyApplied > 0) {
-    return `${result.applied} ti job e apply korechi! (${result.alreadyApplied} te already apply kora chhilo.)`;
+    return `Applied to ${result.applied} job(s)! (${result.alreadyApplied} already applied.)`;
   }
-  if (result.applied > 0) return `${result.applied} ti job e apply kore diyechi! Good luck! 🎉`;
-  if (result.alreadyApplied > 0) return "Apni already ei job(s) e apply korechen.";
-  return "Apply korte parlam na. Age kichhu jobs khunje nin.";
+  if (result.applied > 0) return `Applied to ${result.applied} job(s)! Good luck! 🎉`;
+  if (result.alreadyApplied > 0) return "You have already applied to this job(s).";
+  return "Could not apply. Please search for jobs first.";
 }
 
 /* ──────────────────── Context helpers ──────────────────── */
@@ -937,8 +975,8 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
   // Greeting (empty message)
   if (!lastContent) {
     const greeting = role === "seeker"
-      ? "👋 Hi! I'm Protibha, apnar AI job assistant! Jobs khunje dite pari, apply korte pari. Ki korben bolen?"
-      : "👋 Hi! I'm Protibha! Ami apnake job post korte sahajjo korbo. Ki rokom job post korben?";
+      ? "👋 Hi! I'm Protibha, your AI job assistant. I can find jobs and help you apply. What would you like to do?"
+      : "👋 Hi! I'm Protibha. I'll help you post jobs. What kind of job do you want to post?";
     await appendSessionMessage(session, "assistant", greeting, "greeting");
     return { message: greeting, action: "greeting" };
   }
@@ -956,17 +994,23 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       }
       if (cmd.intent === "employer_find_candidates") {
         const candResult = await executeFindCandidates(user);
+        if (candResult.paymentRequired) {
+          return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+        }
         if (!candResult.candidates.length) {
           await appendSessionMessage(session, "assistant", candResult.message, "message");
           return { message: candResult.message, action: "message" };
         }
-        const formatted = await stage2_formatResponse("candidates", [], {
+        const { formatted, paymentRequired } = await stage2_formatResponse("candidates", [], {
           userId,
           userProfile: null,
           candidateResult: candResult,
           userMessage: lastContent,
         });
-        const msg = formatted || `${candResult.candidates.length} jon matching candidate peyechi apnar jobs er jonno!`;
+        if (paymentRequired) {
+          return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+        }
+        const msg = formatted || `Found ${candResult.candidates.length} matching candidates for your jobs.`;
         await appendSessionMessage(session, "assistant", msg, "show_candidates");
         return {
           message: msg,
@@ -975,12 +1019,15 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
         };
       }
       if (cmd.intent === "employer_tips") {
-        const tips = await aiText(
-          "You are Protibha, a job posting expert for Kolkata businesses. Give 3-4 short, actionable tips for writing better job posts that attract more candidates. Use Banglish (Bengali + English mix). Be warm and practical.",
+        const { result: tips, paymentRequired } = await aiText(
+          "You are Protibha, a job posting expert for Kolkata businesses. Give 3-4 short, actionable tips for writing better job posts that attract more candidates. Write in English only. Be warm and practical.",
           `Employer: ${user.name}, business: ${user.businessName || "N/A"}, location: ${user.location || "Kolkata"}`,
           { userId, temperature: 0.6, maxTokens: 180 },
         );
-        const msg = tips || "Good job posts e clear title, salary range, ar location dile candidates beshi apply kore!";
+        if (paymentRequired) {
+          return { message: MSG_AI_CREDITS_TRY_AGAIN, action: "payment_required" };
+        }
+        const msg = tips || "Good job posts have a clear title, salary range, and location—candidates apply more when details are clear.";
         await appendSessionMessage(session, "assistant", msg, "message");
         return { message: msg, action: "message" };
       }
@@ -996,13 +1043,17 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
   // Helper to build response and persist
   async function buildSearchResponse(jobs, searchType, filters) {
     const serialized = jobs.map(sanitizeJobForClient);
-    const formatted = await stage2_formatResponse("search", serialized, {
+    const { formatted, paymentRequired } = await stage2_formatResponse("search", serialized, {
       userId,
       userProfile,
       searchType,
       filters,
       userMessage: lastContent,
     });
+    if (paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
     const msg = formatted || fallbackSearchMessage(serialized, filters);
 
     // Update session with shown job IDs
@@ -1029,8 +1080,12 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
     const cmd = routeSlashCommand(lastContent, user, userProfile);
 
     if (cmd.intent === "search") {
-      const jobs = await executeJobSearch(user, cmd.filters, cmd.searchType, userProfile);
-      return buildSearchResponse(jobs, cmd.searchType, cmd.filters);
+      const searchResult = await executeJobSearch(user, cmd.filters, cmd.searchType, userProfile);
+      if (searchResult.paymentRequired) {
+        await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+        return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+      }
+      return buildSearchResponse(searchResult.jobs, cmd.searchType, cmd.filters);
     }
     if (cmd.intent === "build_resume") {
       const msg = "📝 Let's build your ATS-optimized resume! Tap the button below to open the Resume Builder.";
@@ -1046,43 +1101,69 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
 
   if (intent === "search") {
     const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
-    filters = stage1.filters || {};
-    if (stage1.intent === "apply") {
+    if (stage1.paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
+    const s1 = stage1.intentResult;
+    filters = s1.filters || {};
+    if (s1.intent === "apply") {
       intent = "apply";
-      applyTarget = stage1.apply_target;
+      applyTarget = s1.apply_target;
     }
   } else if (intent === "apply") {
     const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
-    applyTarget = stage1.apply_target || lastContent;
+    if (stage1.paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
+    applyTarget = stage1.intentResult?.apply_target || lastContent;
   } else if (intent === "similar") {
     // Use similar search directly
   } else {
     const stage1 = await stage1_classifyIntent(userId, lastContent, userProfile, messages);
-    intent = stage1.intent || "general";
-    filters = stage1.filters || {};
-    applyTarget = stage1.apply_target || null;
+    if (stage1.paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
+    const s1 = stage1.intentResult;
+    intent = s1.intent || "general";
+    filters = s1.filters || {};
+    applyTarget = s1.apply_target || null;
   }
 
   // ─── STEP 3: Execute intent ───
 
   if (intent === "search" || intent === "find") {
-    const jobs = await executeJobSearch(user, filters, "filtered", userProfile);
-    return buildSearchResponse(jobs, "filtered", filters);
+    const searchResult = await executeJobSearch(user, filters, "filtered", userProfile);
+    if (searchResult.paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
+    return buildSearchResponse(searchResult.jobs, "filtered", filters);
   }
 
   if (intent === "similar") {
-    const jobs = await executeJobSearch(user, {}, "similar", userProfile);
-    const serialized = jobs.map(sanitizeJobForClient);
-    const formatted = await stage2_formatResponse("similar", serialized, {
+    const searchResult = await executeJobSearch(user, {}, "similar", userProfile);
+    if (searchResult.paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
+    const serialized = searchResult.jobs.map(sanitizeJobForClient);
+    const { formatted, paymentRequired } = await stage2_formatResponse("similar", serialized, {
       userId,
       userProfile,
       searchType: "similar",
       filters: {},
       userMessage: lastContent,
     });
+    if (paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
     const msg = formatted || (serialized.length
-      ? `${serialized.length} ti similar job peyechi!`
-      : "Similar job ekhon paini. Onno keyword try koren!");
+      ? `Found ${serialized.length} similar job(s)!`
+      : "No similar jobs right now. Try different keywords.");
 
     const jobIds = serialized.map(j => {
       try { return toObjectId(j.id); } catch { return null; }
@@ -1101,7 +1182,7 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
     const result = await executeApply(userId, user, applyTarget, contextJobIds);
 
     if (!result.applied && !result.alreadyApplied && !result.failed) {
-      const msg = "Kono job nai apply korar jonno. Age jobs khujen, tarpor \"apply\" bolen! 💡";
+      const msg = "No jobs to apply to. Search for jobs first, then say \"apply\"! 💡";
       await appendSessionMessage(session, "assistant", msg, "show_jobs");
       return { message: msg, action: "show_jobs", payload: { jobs: [] } };
     }
@@ -1112,19 +1193,24 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       try {
         // Refresh profile (new application added)
         const freshProfile = await buildUserProfile(user);
-        similarJobs = (await executeJobSearch(user, {}, "similar", freshProfile, { rankLimit: 5 }))
-          .map(sanitizeJobForClient);
+        const simResult = await executeJobSearch(user, {}, "similar", freshProfile, { rankLimit: 5 });
+        if (!simResult.paymentRequired && simResult.jobs) {
+          similarJobs = simResult.jobs.map(sanitizeJobForClient);
+        }
       } catch { /* ignore */ }
     }
 
-    const formatted = await stage2_formatResponse("apply", [], {
+    const { formatted, paymentRequired } = await stage2_formatResponse("apply", [], {
       userId,
       userProfile,
       applyResult: result,
       userMessage: lastContent,
       similarJobsAfterApply: similarJobs,
     });
-
+    if (paymentRequired) {
+      await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+      return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+    }
     const msg = formatted || fallbackApplyMessage(result);
     await appendSessionMessage(session, "assistant", msg, "apply_success");
 
@@ -1148,12 +1234,15 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
   }
 
   // ─── GENERAL / FALLBACK ───
-  const generalReply = await stage2_formatResponse("general", [], {
+  const { formatted: generalReply, paymentRequired } = await stage2_formatResponse("general", [], {
     userId,
     userProfile,
     userMessage: lastContent,
   });
-
+  if (paymentRequired) {
+    await appendSessionMessage(session, "assistant", MSG_AI_CREDITS_EXHAUSTED, "payment_required");
+    return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+  }
   const msg = generalReply || "Ami bujhte parlam na. Jobs khujte \"delivery jobs\" ba \"find jobs\" bolen! 🔍";
   await appendSessionMessage(session, "assistant", msg, "message");
 

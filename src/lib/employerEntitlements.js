@@ -37,7 +37,7 @@ export async function reserveJobPostingQuota(employerId) {
   const freeUser = await User.findOneAndUpdate(
     { _id: employerId, role: "employer", freeJobsRemaining: { $gt: 0 } },
     { $inc: { freeJobsRemaining: -1 } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (freeUser) {
     return { ok: true, source: "free", user: freeUser };
@@ -47,7 +47,7 @@ export async function reserveJobPostingQuota(employerId) {
   const paidUser = await User.findOneAndUpdate(
     { _id: employerId, role: "employer", paidJobsRemaining: { $gt: 0 } },
     { $inc: { paidJobsRemaining: -1 } },
-    { new: true }
+    { returnDocument: "after" }
   ).lean();
   if (paidUser) {
     return { ok: true, source: "paid", user: paidUser };

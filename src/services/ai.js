@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import logger from "../lib/logger.js";
 import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
+import { reserveAiCredits, rollbackAiCredits } from "../lib/aiCredits.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_AVAILABLE = !!process.env.OPENAI_API_KEY;
@@ -28,15 +29,26 @@ function parseJsonFromResponse(raw) {
   }
 }
 
+function estimateTokensForCall(promptText, maxOutputTokens) {
+  return Math.ceil(String(promptText || "").length / 4) + Math.max(1, parseInt(maxOutputTokens, 10) || 200);
+}
+
 async function chatJson(system, userContent, opts = {}) {
   const c = getClient();
-  if (!c) return null;
+  if (!c) return { result: null, paymentRequired: false };
+  const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
+  const prompt = truncateAiInput(`${system}\n\n${userContent}`);
+  const estimated = estimateTokensForCall(prompt, maxTokens);
+  const reservation = await reserveAiCredits(opts.userId, estimated);
+  if (!reservation.ok) {
+    return { result: null, paymentRequired: true };
+  }
   try {
-    const maxTokens = clampAiOutputTokens(opts.maxTokens, 220);
-    const prompt = truncateAiInput(`${system}\n\n${userContent}`);
     const budget = enforceAiBudget({ userId: opts.userId, promptText: prompt, maxOutputTokens: maxTokens });
-    if (!budget.ok) return null;
-
+    if (!budget.ok) {
+      await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+      return { result: null, paymentRequired: false };
+    }
     const r = await c.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
@@ -48,10 +60,12 @@ async function chatJson(system, userContent, opts = {}) {
       max_tokens: maxTokens,
     });
     const raw = (r.choices[0]?.message?.content || "").trim();
-    return raw ? parseJsonFromResponse(raw) : null;
+    const result = raw ? parseJsonFromResponse(raw) : null;
+    return { result, paymentRequired: false };
   } catch (e) {
     logger.warn({ err: e.message }, "OpenAI chat failed");
-    return null;
+    await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    return { result: null, paymentRequired: false };
   }
 }
 
@@ -73,9 +87,10 @@ export async function analyzePortfolio(rawText, projects = [], links = [], opts 
 2. experience: "Fresher" or "1-2 years" or "3-5 years" or "5+ years"
 3. category: job category - Sales, Delivery, Retail, Hospitality, Office Work, Driver, Warehouse, Restaurant, Security, Other
 4. score: 0-100 talent score based on clarity, skills, experience
-5. feedback: 1-2 sentence improvement tips (skill gap, what to add). Be encouraging. In English.
+5. feedback: 1-2 sentence improvement tips in English only (skill gap, what to add). Be encouraging. Do not use Bengali or Hindi.
 Output ONLY valid JSON with keys: skills, experience, category, score, feedback.`;
-  const data = await chatJson(system, `${content}\nReturn JSON only:`, { userId: opts.userId, maxTokens: 220 });
+  const { result: data, paymentRequired } = await chatJson(system, `${content}\nReturn JSON only:`, { userId: opts.userId, maxTokens: 220 });
+  if (paymentRequired) return { ...defaultOut, paymentRequired: true };
   if (!data) return defaultOut;
   let skills = data.skills || [];
   if (typeof skills === "string") skills = skills.split(",").map((s) => s.trim()).filter(Boolean);
@@ -107,9 +122,11 @@ export async function generateJobFromText(text, employerLocation, opts = {}) {
   const system = `You are a job posting assistant for Kolkata businesses. Convert the employer's casual text into a structured job post.
 Output ONLY valid JSON with: title, category, description, salary, location, jobType (Full-time or Part-time), experience (Fresher, 1-2 years, 3-5 years, 5+ years), education (Any, 10th Pass, 12th Pass, Graduate, Post Graduate), languages (array), skills (array).
 Categories: Sales, Delivery, Retail, Hospitality, Office Work, Driver, Warehouse, Restaurant, Security, Other.
-If location missing, use Kolkata. Salary format: ₹X,000 - ₹Y,000/month. Keep description concise.`;
+If location missing, use Kolkata. Salary format: ₹X,000 - ₹Y,000/month. Keep description concise.
+Write all text fields (title, description, etc.) in English only.`;
   const prompt = `Employer text: "${text}"\nDefault location: ${employerLocation || "Kolkata"}\nReturn JSON only:`;
-  const data = await chatJson(system, prompt, { userId: opts.userId, maxTokens: 220 });
+  const { result: data, paymentRequired } = await chatJson(system, prompt, { userId: opts.userId, maxTokens: 220 });
+  if (paymentRequired) return { ...defaultOut, paymentRequired: true };
   if (!data) return defaultOut;
   let skills = data.skills || [];
   if (typeof skills === "string") skills = skills.split(",").map((s) => s.trim()).filter(Boolean);
@@ -158,10 +175,11 @@ Jobs (rank these by fit):
 ${JSON.stringify(jobsSummary, null, 2)}
 
 Return JSON with ranked_ids in best-to-worst match order:`;
-  const data = await chatJson(system, userContent, {
+  const { result: data, paymentRequired } = await chatJson(system, userContent, {
     userId: opts.userId || seeker?._id?.toString?.() || seeker?.id,
     maxTokens: 220,
   });
+  if (paymentRequired) return { paymentRequired: true };
   if (!data?.ranked_ids) {
     return jobs.slice(0, topN).map((j) => String(j.id ?? j._id ?? ""));
   }
@@ -198,10 +216,11 @@ Candidates (rank these by fit):
 ${JSON.stringify(candSummary, null, 2)}
 
 Return JSON with ranked_ids in best-to-worst fit order:`;
-  const data = await chatJson(system, userContent, {
+  const { result: data, paymentRequired } = await chatJson(system, userContent, {
     userId: opts.userId || job?.employerId,
     maxTokens: 220,
   });
+  if (paymentRequired) return { paymentRequired: true };
   if (!data?.ranked_ids) {
     return candidates.slice(0, topN).map((c) => String(c.id ?? c._id ?? ""));
   }

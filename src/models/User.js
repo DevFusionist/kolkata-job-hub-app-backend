@@ -48,6 +48,14 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    aiFreeTokensRemaining: {
+      type: Number,
+      default: Math.max(parseInt(process.env.AI_FREE_TOKENS_LIFETIME || "6000", 10), 0),
+    },
+    aiPaidTokensRemaining: {
+      type: Number,
+      default: 0,
+    },
     location: {
       type: String,
       trim: true,

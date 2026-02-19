@@ -14,7 +14,7 @@ const transactionSchema = new mongoose.Schema(
     },
     purchaseType: {
       type: String,
-      enum: ["credit", "subscription"],
+      enum: ["credit", "subscription", "ai_credits"],
       default: "credit",
       index: true,
     },
@@ -24,6 +24,10 @@ const transactionSchema = new mongoose.Schema(
       index: true,
     },
     creditsPurchased: {
+      type: Number,
+      default: 0,
+    },
+    aiTokensPurchased: {
       type: Number,
       default: 0,
     },

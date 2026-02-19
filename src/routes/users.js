@@ -160,7 +160,7 @@ router.put("/users/:userId", requireUser, async (req, res) => {
     const user = await User.findByIdAndUpdate(
       req.params.userId,
       { $set: safeFields },
-      { new: true, runValidators: true }
+      { returnDocument: "after", runValidators: true }
     ).lean();
     if (!user) return res.status(404).json({ detail: "User not found" });
     invalidateUserCache(req.userId);

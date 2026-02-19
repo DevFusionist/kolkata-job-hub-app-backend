@@ -11,6 +11,7 @@ import OpenAI from "openai";
 import { User, Portfolio, Application, Job } from "../models/index.js";
 import { uploadFile } from "../lib/r2.js";
 import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
+import { reserveAiCredits, rollbackAiCredits } from "../lib/aiCredits.js";
 import logger from "../lib/logger.js";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -131,15 +132,25 @@ Generate a professional, ATS-friendly resume JSON:`;
     return buildFallbackResume(resumeData);
   }
 
-  try {
-    const maxTokens = clampAiOutputTokens(420, 420);
-    const promptText = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
-    const budget = enforceAiBudget({ userId: opts.userId, promptText, maxOutputTokens: maxTokens });
-    if (!budget.ok) {
-      logger.warn({ userId: opts.userId, reason: budget.reason }, "AI resume budget exceeded, using fallback");
-      return buildFallbackResume(resumeData);
-    }
+  const maxTokens = clampAiOutputTokens(420, 420);
+  const promptText = truncateAiInput(`${systemPrompt}\n\n${userPrompt}`);
+  const budget = enforceAiBudget({ userId: opts.userId, promptText, maxOutputTokens: maxTokens });
+  if (!budget.ok) {
+    logger.warn({ userId: opts.userId, reason: budget.reason }, "AI resume budget exceeded, using fallback");
+    return buildFallbackResume(resumeData);
+  }
 
+  // Reserve AI credits before calling OpenAI
+  const estimatedTokens = Math.ceil((promptText.length || 0) / 4) + maxTokens;
+  let reservation = null;
+  if (opts.userId) {
+    reservation = await reserveAiCredits(opts.userId, Math.min(estimatedTokens, 1200));
+    if (!reservation.ok) {
+      return { paymentRequired: true };
+    }
+  }
+
+  try {
     const response = await client.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
@@ -155,6 +166,9 @@ Generate a professional, ATS-friendly resume JSON:`;
     const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/, "").replace(/\s*```\s*$/, ""));
     return parsed;
   } catch (e) {
+    if (reservation?.ok && opts.userId) {
+      await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    }
     logger.error({ err: e.message }, "AI resume generation failed, using fallback");
     return buildFallbackResume(resumeData);
   }

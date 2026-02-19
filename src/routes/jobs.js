@@ -168,7 +168,7 @@ router.put("/jobs/:jobId/status", requireEmployer, async (req, res) => {
     const job = await Job.findOneAndUpdate(
       { _id: req.params.jobId, employerId: req.employerId },
       { $set: { status } },
-      { new: true }
+      { returnDocument: "after" }
     );
     if (!job) return res.status(404).json({ detail: "Job not found or not owned by you" });
     res.json({ success: true });

@@ -135,11 +135,33 @@ router.post(
       }
     }
 
-    // 3. Run AI analysis on extracted text
+    // 3. Run AI analysis on extracted text (consumes AI credits)
     let aiResult = null;
     if (extractedText.trim().length > 10) {
       try {
         aiResult = await analyzePortfolio(extractedText, [], [], { userId: seekerId });
+        if (aiResult?.paymentRequired) {
+          // Upload and rawText are saved below; return 402 so client can show payment modal
+          const portfolioUpdate = {
+            resumeUrl: resumeUrl ?? null,
+            resumeFileName: file.originalname,
+            rawText: extractedText.slice(0, 10000),
+          };
+          let portfolio = await Portfolio.findOne({ seeker: seekerId }).sort({ createdAt: -1 });
+          if (portfolio) {
+            Object.assign(portfolio, portfolioUpdate);
+            await portfolio.save();
+          } else {
+            portfolio = await Portfolio.create({ seeker: seekerId, ...portfolioUpdate });
+          }
+          return res.status(402).json({
+            detail: "AI credits exhausted. Resume uploaded. Buy credits to analyze it.",
+            action: "payment_required",
+            saved: true,
+            resumeUrl,
+            fileName: file.originalname,
+          });
+        }
       } catch (e) {
         logger.warn({ err: e.message }, "AI portfolio analysis failed during upload");
       }
@@ -232,8 +254,15 @@ router.post(
     }
     if (overrides.portfolioText) resumeData.portfolioText = String(overrides.portfolioText).slice(0, 4000);
 
-    // 2. Generate resume with AI
-    const resumeJson = await generateResumeWithAI(resumeData, { userId: seekerId });
+    // 2. Generate resume with AI (consumes AI credits)
+    const resumeResult = await generateResumeWithAI(resumeData, { userId: seekerId });
+    if (resumeResult && typeof resumeResult === "object" && resumeResult.paymentRequired) {
+      return res.status(402).json({
+        detail: "AI credits exhausted. Buy credits to generate an AI resume.",
+        action: "payment_required",
+      });
+    }
+    const resumeJson = resumeResult;
 
     // 3. Render to PDF
     const { html, pdf } = await renderResumePDF(resumeJson);
