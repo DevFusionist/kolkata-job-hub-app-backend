@@ -158,6 +158,15 @@ function normalize(text) {
     .replace(/\s+/g, " ").trim();
 }
 
+function toAsciiDigits(text) {
+  // Supports Bengali (০-৯) and Devanagari (०-९) numerals.
+  const map = {
+    "০": "0", "১": "1", "২": "2", "৩": "3", "৪": "4", "৫": "5", "৬": "6", "৭": "7", "৮": "8", "৯": "9",
+    "०": "0", "१": "1", "२": "2", "३": "3", "४": "4", "५": "5", "६": "6", "७": "7", "८": "8", "९": "9",
+  };
+  return String(text || "").replace(/[০-৯०-९]/g, (ch) => map[ch] || ch);
+}
+
 /* ──────────────────── ChatSession persistence ──────────────────── */
 
 async function getOrCreateSession(userId) {
@@ -180,7 +189,14 @@ async function appendSessionMessage(session, role, content, action = null, paylo
 
 async function updateSessionMemory(session, updates) {
   if (updates.lastJobIds) session.lastJobIds = updates.lastJobIds;
-  if (updates.jobDraft !== undefined) session.jobDraft = updates.jobDraft;
+  if (updates.jobDraft !== undefined) {
+    session.jobDraft = updates.jobDraft;
+    session.markModified("jobDraft");
+  }
+  if ("jobPostingFlow" in updates) {
+    session.memory = session.memory || {};
+    session.memory.jobPostingFlow = updates.jobPostingFlow;
+  }
   if (updates.preferredLocation) session.memory.preferredLocation = updates.preferredLocation;
   if (updates.preferredCategory) session.memory.preferredCategory = updates.preferredCategory;
   if (updates.lastSearchFilters) session.memory.lastSearchFilters = updates.lastSearchFilters;
@@ -696,78 +712,264 @@ async function executeApply(userId, user, applyTarget, contextJobIds) {
 
 /* ──────────────────── Employer flow (Mongoose) ──────────────────── */
 
-function getNextJobStep(draft) {
-  if (!draft.category || draft.category === "?") return "category";
-  if (!draft.location || draft.location === "?") return "location";
-  if (!draft.salary || draft.salary === "?") return "salary";
-  if (!draft.jobType || draft.jobType === "?") return "jobType";
-  if (!draft.experience || draft.experience === "?") return "experience";
-  if (!draft.description || draft.description === "?") return "description";
-  return "confirm";
+function isEmployerCancel(text) {
+  const t = normalize(text);
+  return /^(exit|quit|cancel|stop|restart|reset|start over|clear)$/i.test(t) || /^\/(exit|quit|cancel|restart|reset|clear)$/i.test(t);
 }
 
-function resolveCategory(text) {
-  const t = (text || "").toLowerCase().trim();
-  for (const c of JOB_CATEGORIES) {
-    if (c.toLowerCase().includes(t) || t.includes(c.toLowerCase())) return c;
-  }
-  if (/beautician|beauty|parlour|salon/i.test(t)) return "Beautician";
-  if (/sales|sell/i.test(t)) return "Sales";
-  if (/delivery|deliver/i.test(t)) return "Delivery";
-  if (/driver|drive/i.test(t)) return "Driver";
-  if (/retail|shop/i.test(t)) return "Retail";
-  if (/restaurant|food|cook|kitchen/i.test(t)) return "Restaurant";
-  return text?.trim() || null;
+function isEmployerNegative(text) {
+  const t = normalize(text);
+  return /^(no|nah|nope|not now|later|না|nahin|nahi)$/i.test(t);
 }
 
-function extractSalary(text) {
-  const t = (text || "").toLowerCase();
-  const match = t.match(/(\d+)\s*(?:to|-|–)\s*(\d+)\s*(?:thousand|k|000)?/i) ||
-    t.match(/(\d+)\s*(?:thousand|k)/i) ||
-    t.match(/₹?\s*(\d+)\s*(?:,\d+)*/);
-  if (match) {
-    const a = parseInt(match[1], 10);
-    const b = match[2] ? parseInt(match[2], 10) : a;
-    const lo = Math.min(a, b);
-    const hi = Math.max(a, b);
-    const fmt = (n) => (n >= 1000 ? `₹${n / 1000},000` : `₹${n}`);
-    return `${fmt(lo)} - ${fmt(hi)}/month`;
-  }
-  return null;
+function isEmployerConfirm(text) {
+  const t = normalize(text);
+  return /^(yes|y|ok|okay|post|confirm|done|ঠিক আছে|হ্যাঁ|হাঁ)$/i.test(t);
 }
 
-function parseEmployerResponse(step, userText, draft) {
-  const text = (userText || "").trim();
-  if (!text) return { ...draft };
-  const next = { ...draft };
-  switch (step) {
-    case "category":
-      next.category = resolveCategory(text) || draft.category || "Other";
-      break;
-    case "location":
-      next.location = text || draft.location || "Kolkata";
-      break;
-    case "salary":
-      next.salary = extractSalary(text) || text || draft.salary || "₹10,000 - ₹15,000/month";
-      break;
-    case "jobType": {
-      const jt = JOB_TYPES.find((x) => text.toLowerCase().includes(x.toLowerCase().replace("-", "")));
-      next.jobType = jt || (text.toLowerCase().includes("part") ? "Part-time" : "Full-time");
-      break;
-    }
-    case "experience": {
-      const ex = EXPERIENCE_LEVELS.find((x) => text.toLowerCase().includes(x.toLowerCase()));
-      next.experience = ex || "Fresher";
-      break;
-    }
-    case "description":
-      if (/no|skip|na|nahi/i.test(text)) next.description = "See requirements.";
-      else next.description = text || draft.description || "See requirements.";
-      break;
-    default:
-      break;
+function isValidSalaryText(salary) {
+  const t = String(salary || "").trim().toLowerCase();
+  if (!t) return false;
+  if (/negotiable|as per|depends|tbd/.test(t)) return true;
+  return /\d/.test(t);
+}
+
+function normalizeSalaryFromUserText(text) {
+  const t = toAsciiDigits(String(text || "").trim());
+  if (!t) return null;
+  if (/negotiable|as per|depends|tbd/i.test(t)) return "Negotiable";
+
+  const nums = t.match(/\d+/g)?.map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n) && n > 0) || [];
+  if (!nums.length) return null;
+
+  // If numbers look like "6-7" or "6 7", interpret as thousands per month.
+  const max = Math.max(...nums);
+  const scaled = max < 1000 ? nums.map((n) => n * 1000) : nums;
+  const lo = Math.min(...scaled);
+  const hi = scaled.length >= 2 ? Math.max(...scaled) : lo;
+
+  const fmt = (n) => `₹${String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+  if (lo === hi) return `${fmt(lo)}/month`;
+  return `${fmt(lo)} - ${fmt(hi)}/month`;
+}
+
+/* ──────────────────── Employer: AI-driven conversational job posting ──────────────────── */
+
+const JOB_POSTING_SCHEMA = {
+  category:    { label: "Job Category",        allowed: JOB_CATEGORIES },
+  location:    { label: "Location",            hint: "e.g. Garia, Salt Lake, Park Street" },
+  salary:      { label: "Salary",              hint: "e.g. ₹8,000 - ₹12,000/month or Negotiable" },
+  jobType:     { label: "Job Type",            allowed: JOB_TYPES },
+  experience:  { label: "Experience Required", allowed: EXPERIENCE_LEVELS },
+  description: { label: "Job Description",     hint: "Type 'skip' to skip" },
+};
+
+const EMPLOYER_QUESTION_GEN_SYSTEM = `You are Protibha, a friendly assistant for Kolkata Job Hub.
+Generate warm, conversational questions to collect job posting details from an employer.
+Each question must be short, friendly, and include a helpful hint with Kolkata-relevant examples.
+
+Return ONLY valid JSON:
+{
+  "questions": [
+    { "field": "category",    "question": "...", "hint": "..." },
+    { "field": "location",    "question": "...", "hint": "..." },
+    { "field": "salary",      "question": "...", "hint": "..." },
+    { "field": "jobType",     "question": "...", "hint": "..." },
+    { "field": "experience",  "question": "...", "hint": "..." },
+    { "field": "description", "question": "...", "hint": "..." }
+  ]
+}
+
+Generate exactly 6 questions in that field order. For description, remind the employer they can type 'skip'.`;
+
+async function aiGenerateJobQuestions(userId, user) {
+  const ctx = `Employer: ${user.name || "Employer"}, Business: ${user.businessName || "N/A"}, City: ${user.location || "Kolkata"}`;
+  const { result, paymentRequired } = await aiJson(
+    EMPLOYER_QUESTION_GEN_SYSTEM,
+    `${ctx}\n\nGenerate job posting questions:`,
+    { userId, maxTokens: 600 },
+  );
+  if (paymentRequired) return { questions: null, paymentRequired: true };
+
+  const fallback = [
+    { field: "category",    question: "What type of job are you posting? 💼",                      hint: "e.g. Sales, Delivery, Security, Beautician, Driver, Restaurant" },
+    { field: "location",    question: "📍 Where is the job located?",                              hint: "e.g. Garia, Salt Lake, Park Street, Dum Dum" },
+    { field: "salary",      question: "💰 What is the salary range?",                              hint: "e.g. ₹8,000 - ₹12,000/month or Negotiable" },
+    { field: "jobType",     question: "Is this a Full-time or Part-time position?",                hint: "Type 'full' or 'part'" },
+    { field: "experience",  question: "What experience level is required?",                        hint: "e.g. Fresher, 1-2 years, 3-5 years, 5+ years" },
+    { field: "description", question: "📝 Briefly describe the job role and requirements.",        hint: "Type 'skip' to skip this step" },
+  ];
+
+  const valid = Array.isArray(result?.questions) && result.questions.length === 6;
+  return { questions: valid ? result.questions : fallback, paymentRequired: false };
+}
+
+const EMPLOYER_ANSWER_VALIDATE_SYSTEM = `You are validating an employer's reply during a conversational job posting flow on Kolkata Job Hub.
+
+Determine if the reply is:
+- "answer": directly answering the current question (even if phrased informally or in mixed language)
+- "general": general chat, greeting, question, or unrelated to the current question
+
+Extraction and normalization rules:
+- category: match to closest allowed value; MUST be from the allowed list.
+- salary: small numbers like "6-7" mean thousands (₹6,000-₹7,000/month). Format as "₹X,XXX - ₹Y,YYY/month".
+- jobType: normalize to exactly "Full-time" or "Part-time".
+- experience: normalize to the closest allowed value.
+- location: any area/locality name with 3+ characters is valid.
+- description: any text 8+ chars is valid. "skip"/"no"/"na"/"n/a" → "See requirements."
+
+Return ONLY valid JSON:
+{
+  "type": "answer|general",
+  "extracted_value": "normalized value if answer, null if general",
+  "valid": true,
+  "validation_message": "brief reason if valid is false (omit if valid)",
+  "reply": "short friendly response (acknowledge if answer, respond to chat if general)"
+}`;
+
+async function aiValidateEmployerAnswer(userId, field, question, hint, message) {
+  const schemaField = JOB_POSTING_SCHEMA[field] || {};
+  const allowed = schemaField.allowed
+    ? `\nAllowed values for "${field}": ${JSON.stringify(schemaField.allowed)}`
+    : "";
+
+  const userPrompt = `Field: "${field}" (${schemaField.label || field})
+Question asked: "${question}"
+Hint: "${hint || ""}"${allowed}
+Employer's reply: "${message}"
+
+Classify and extract:`;
+
+  const { result, paymentRequired } = await aiJson(
+    EMPLOYER_ANSWER_VALIDATE_SYSTEM,
+    userPrompt,
+    { userId, maxTokens: 200 },
+  );
+  if (paymentRequired) return { type: null, paymentRequired: true };
+  if (!result || typeof result !== "object") return { type: "general", reply: null, paymentRequired: false };
+  return { ...result, paymentRequired: false };
+}
+
+const EMPLOYER_GENERAL_CHAT_SYSTEM = `You are Protibha, a smart business assistant for employers on Kolkata Job Hub.
+
+You help employers with:
+- Hiring advice and tips for Kolkata's job market
+- Writing effective job descriptions for blue-collar and service roles
+- Salary benchmarks for various roles in Kolkata
+- How to attract more applicants to their job posts
+- Platform features (job posting, finding candidates, etc.)
+
+Reply in English, warmly and concisely (2-4 sentences max).
+If they want to post a job, suggest /postJob.
+If they want to find candidates, suggest /findCandidates.
+If they want hiring tips, suggest /tips.`;
+
+async function aiEmployerGeneralChat(userId, user, message, session) {
+  const history = (session.messages || []).slice(-8).map(m => `${m.role}: ${m.content}`).join("\n");
+  const userPrompt = `Employer: ${user.name || "Employer"}, Business: ${user.businessName || "N/A"}, Location: ${user.location || "Kolkata"}
+Recent conversation:
+${history}
+
+Message: "${message}"`;
+
+  const { result: reply, paymentRequired } = await aiText(
+    EMPLOYER_GENERAL_CHAT_SYSTEM,
+    userPrompt,
+    { userId, temperature: 0.7, maxTokens: 200 },
+  );
+  if (paymentRequired) return { reply: null, paymentRequired: true };
+  return {
+    reply: reply || "I'm here to help! Post a job with /postJob, find candidates with /findCandidates, or ask me anything about hiring.",
+    paymentRequired: false,
+  };
+}
+
+function buildJobDraftSummary(answers) {
+  return [
+    "📋 Here's your job posting:",
+    `• Category:    ${answers.category    || "?"}`,
+    `• Location:    ${answers.location    || "?"}`,
+    `• Salary:      ${answers.salary      || "?"}`,
+    `• Type:        ${answers.jobType     || "?"}`,
+    `• Experience:  ${answers.experience  || "?"}`,
+    `• Description: ${answers.description || "See requirements."}`,
+  ].join("\n");
+}
+
+async function finalizeJobPosting(userId, user, answers, session) {
+  const draft = {
+    category:    answers.category    || "",
+    location:    answers.location    || "",
+    salary:      answers.salary      || "",
+    jobType:     answers.jobType     || "Full-time",
+    experience:  answers.experience  || "Fresher",
+    description: answers.description || "See requirements.",
+  };
+
+  const { errors, cat, jt, ex, desc } = validateJobDraft(draft);
+  if (errors.length) {
+    return {
+      message: `Some details need fixing: ${errors.join(", ")}. Please start again with /postJob.`,
+      action: "error",
+    };
   }
-  return next;
+
+  const title = `${cat} - ${draft.location}`;
+  const recentDup = await Job.findOne({
+    employerId: userId,
+    title,
+    location: draft.location,
+    postedDate: { $gte: new Date(Date.now() - 5 * 60 * 1000) },
+  });
+  if (recentDup) {
+    return { message: "You just posted a similar job moments ago. Please wait a few minutes before posting again.", action: "error" };
+  }
+
+  const reservation = await reserveJobPostingQuota(userId);
+  if (!reservation.ok) {
+    return { message: MSG_JOB_POST_PAYMENT_REQUIRED, action: "payment_required" };
+  }
+  const employerWithCredit = reservation.user;
+
+  const { salaryMin, salaryMax } = parseSalaryRange(draft.salary);
+  let job;
+  try {
+    job = await Job.create({
+      title,
+      category: cat,
+      description: desc || "See requirements.",
+      salary: draft.salary,
+      salaryMin,
+      salaryMax,
+      location: draft.location,
+      jobType: jt || "Full-time",
+      experience: ex || "Fresher",
+      education: "Any",
+      languages: ["Bengali", "Hindi", "English"],
+      skills: [cat],
+      employerId: userId,
+      employerName: employerWithCredit.name,
+      employerPhone: employerWithCredit.phone,
+      businessName: employerWithCredit.businessName,
+      postedDate: new Date(),
+      status: "active",
+      applicationsCount: 0,
+      isPaid: reservation.source !== "free",
+    });
+  } catch (e) {
+    await rollbackJobPostingQuota(userId, reservation.source);
+    invalidateUserCache(userId);
+    throw e;
+  }
+  invalidateUserCache(userId);
+  await updateSessionMemory(session, { jobPostingFlow: null, jobDraft: null });
+
+  const jobJson = job.toJSON();
+  return {
+    message: `🎉 Your job "${title}" is now live! Candidates can see and apply to it.`,
+    action: "post_job_success",
+    payload: { jobId: jobJson.id, job: jobJson },
+  };
 }
 
 function sanitizeEnum(val, list) {
@@ -779,8 +981,9 @@ function validateJobDraft(draft) {
   const errors = [];
   const cat = sanitizeEnum(draft.category, JOB_CATEGORIES);
   if (!cat) errors.push("Invalid category");
-  if (!draft.location || String(draft.location).trim().length < 2) errors.push("Location required");
+  if (!draft.location || String(draft.location).trim().length < 3) errors.push("Location required");
   if (!draft.salary || String(draft.salary).trim().length < 2) errors.push("Salary required");
+  if (draft.salary && !isValidSalaryText(draft.salary)) errors.push("Salary invalid");
   const jt = sanitizeEnum(draft.jobType, JOB_TYPES);
   if (!jt) errors.push("Invalid job type");
   const ex = sanitizeEnum(draft.experience, EXPERIENCE_LEVELS);
@@ -793,7 +996,8 @@ function validateJobDraft(draft) {
 }
 
 function parseSalaryRange(salary) {
-  const nums = String(salary || "").match(/\d+/g);
+  const cleaned = toAsciiDigits(String(salary || "")).replace(/,/g, "");
+  const nums = cleaned.match(/\d+/g);
   if (!nums || nums.length === 0) return { salaryMin: 0, salaryMax: 0 };
   const parsed = nums.map(Number);
   return {
@@ -802,103 +1006,131 @@ function parseSalaryRange(salary) {
   };
 }
 
-async function handleEmployerFlow(userId, lastContent, jobDraft, session) {
-  const draft = jobDraft || session?.jobDraft || {
-    category: "?", location: "?", salary: "?",
-    jobType: "?", experience: "?", description: "?",
-  };
+async function handleEmployerFlow(userId, lastContent, session) {
+  const user = await User.findById(userId).lean();
+  if (!user || user.role !== "employer") {
+    return { message: "Only employers can use this feature.", action: "error" };
+  }
 
-  const step = getNextJobStep(draft);
-  const updatedDraft = parseEmployerResponse(step, lastContent, draft);
+  const flow = session?.memory?.jobPostingFlow;
 
-  const confirmWords = /yes|হ্যাঁ|হাঁ|ok|post|করুন|korum|confirm|ঠিক আছে/i;
-  if (step === "confirm" && confirmWords.test(lastContent)) {
-    const employer = await User.findById(userId).lean();
-    if (!employer || employer.role !== "employer") {
-      return { message: "Only employers can post jobs.", action: "error" };
-    }
-
-    const { errors, cat, jt, ex, desc } = validateJobDraft(updatedDraft);
-    if (errors.length) {
-      return { message: `Job details invalid: ${errors.join(", ")}`, action: "error" };
-    }
-
-    const title = `${updatedDraft.category} - ${updatedDraft.location}`.replace(/\?/g, "Kolkata");
-    const recentDup = await Job.findOne({
-      employerId: userId,
-      title,
-      location: updatedDraft.location,
-      postedDate: { $gte: new Date(Date.now() - 5 * 60 * 1000) },
-    });
-    if (recentDup) return { message: "You just posted a similar job moments ago.", action: "error" };
-
-    const reservation = await reserveJobPostingQuota(userId);
-    if (!reservation.ok) {
-      return { message: MSG_JOB_POST_PAYMENT_REQUIRED, action: "payment_required" };
-    }
-    const employerWithCredit = reservation.user;
-
-    const { salaryMin, salaryMax } = parseSalaryRange(updatedDraft.salary);
-    let job;
-    try {
-      job = await Job.create({
-        title,
-        category: cat,
-        description: desc || "See requirements.",
-        salary: updatedDraft.salary,
-        salaryMin,
-        salaryMax,
-        location: updatedDraft.location,
-        jobType: jt || "Full-time",
-        experience: ex || "Fresher",
-        education: "Any",
-        languages: ["Bengali", "Hindi", "English"],
-        skills: [cat],
-        employerId: userId,
-        employerName: employerWithCredit.name,
-        employerPhone: employerWithCredit.phone,
-        businessName: employerWithCredit.businessName,
-        postedDate: new Date(),
-        status: "active",
-        applicationsCount: 0,
-        isPaid: reservation.source !== "free",
-      });
-    } catch (e) {
-      await rollbackJobPostingQuota(userId, reservation.source);
-      invalidateUserCache(userId);
-      throw e;
-    }
-    invalidateUserCache(userId);
-
-    // Clear the draft from session
-    if (session) await updateSessionMemory(session, { jobDraft: null });
-
-    const jobJson = job.toJSON();
+  // Cancel at any time during the flow
+  if (isEmployerCancel(lastContent)) {
+    await updateSessionMemory(session, { jobPostingFlow: null, jobDraft: null });
     return {
-      message: `🎉 Job posted! "${title}" is live. Candidates can apply now.`,
-      action: "post_job_success",
-      payload: { jobId: jobJson.id, job: jobJson },
+      message: "Job posting cancelled. Start again anytime with /postJob, or ask me anything! 😊",
+      action: "job_creation_cancelled",
+      payload: { jobDraft: null },
     };
   }
 
-  // Save draft to session for continuity
-  if (session) await updateSessionMemory(session, { jobDraft: updatedDraft });
+  // /postJob entrypoint: lastContent === "" signals a fresh start
+  if (lastContent === "") {
+    const { questions, paymentRequired } = await aiGenerateJobQuestions(userId, user);
+    if (paymentRequired) return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
 
-  const nextStep = getNextJobStep(updatedDraft);
-  const prompts = {
-    category: "What kind of job do you want to post? (e.g. Beautician, Sales, Delivery, Retail)",
-    location: "📍 Where is the location? (e.g. Garia, Park Street, Salt Lake)",
-    salary: "💰 What is the salary range? (e.g. ₹10,000 - ₹15,000/month)",
-    jobType: "Full-time or Part-time?",
-    experience: "Experience level? (Fresher, 1-2 years, 3-5 years, 5+ years)",
-    description: "Add a short description. (Optional – say 'skip' to skip)",
-    confirm: `📋 Your job: ${updatedDraft.category} at ${updatedDraft.location}, ${updatedDraft.salary}. Post it?`,
-  };
-  return {
-    message: prompts[nextStep],
-    action: "job_creation_step",
-    payload: { jobDraft: updatedDraft, nextStep },
-  };
+    const newFlow = { active: true, questions, currentIdx: 0, answers: {} };
+    await updateSessionMemory(session, { jobPostingFlow: newFlow });
+
+    const q = questions[0];
+    const msg = `Let's post your job! I'll ask you ${questions.length} quick questions. 🚀\n\n${q.question}${q.hint ? `\n_(${q.hint})_` : ""}`;
+    return {
+      message: msg,
+      action: "job_creation_step",
+      payload: { nextStep: q.field, questionIdx: 0, totalQuestions: questions.length },
+    };
+  }
+
+  // Active job posting flow
+  if (flow?.active && Array.isArray(flow.questions) && flow.questions.length > 0) {
+    const currentIdx = typeof flow.currentIdx === "number" ? flow.currentIdx : 0;
+
+    // All questions answered → confirmation step
+    if (currentIdx >= flow.questions.length) {
+      if (isEmployerNegative(lastContent)) {
+        await updateSessionMemory(session, { jobPostingFlow: null });
+        return {
+          message: "No problem! Start a new job post anytime with /postJob. 😊",
+          action: "job_creation_cancelled",
+          payload: { jobDraft: null },
+        };
+      }
+      if (isEmployerConfirm(lastContent)) {
+        return await finalizeJobPosting(userId, user, flow.answers, session);
+      }
+      // Not a clear yes/no – re-show summary
+      const summary = buildJobDraftSummary(flow.answers);
+      return {
+        message: `${summary}\n\nReady to post? Reply yes to confirm or no to cancel.`,
+        action: "job_creation_step",
+        payload: { nextStep: "confirm", answers: flow.answers },
+      };
+    }
+
+    const currentQ = flow.questions[currentIdx];
+
+    // AI validates whether this message answers the current question or is general chat
+    const validation = await aiValidateEmployerAnswer(
+      userId,
+      currentQ.field,
+      currentQ.question,
+      currentQ.hint || "",
+      lastContent,
+    );
+    if (validation.paymentRequired) return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+
+    // General chat – respond naturally and re-ask the pending question
+    if (!validation || validation.type === "general") {
+      const generalReply = validation?.reply ? `${validation.reply}\n\n` : "";
+      const reask = `${currentQ.question}${currentQ.hint ? `\n_(${currentQ.hint})_` : ""}`;
+      return {
+        message: `${generalReply}${reask}`,
+        action: "job_creation_step",
+        payload: { nextStep: currentQ.field, questionIdx: currentIdx, totalQuestions: flow.questions.length },
+      };
+    }
+
+    // Invalid answer – explain and re-ask
+    if (validation.type === "answer" && !validation.valid) {
+      const hintText = currentQ.hint ? `\n_(Hint: ${currentQ.hint})_` : "";
+      return {
+        message: `${validation.validation_message || "That doesn't look right."} Please try again.${hintText}\n\n${currentQ.question}`,
+        action: "job_creation_step",
+        payload: { nextStep: currentQ.field, questionIdx: currentIdx, totalQuestions: flow.questions.length },
+      };
+    }
+
+    // Valid answer – store and advance to next question
+    const value = validation.extracted_value || lastContent;
+    const updatedAnswers = { ...flow.answers, [currentQ.field]: value };
+    const nextIdx = currentIdx + 1;
+
+    if (nextIdx >= flow.questions.length) {
+      // All questions answered → show summary and ask for confirmation
+      await updateSessionMemory(session, { jobPostingFlow: { ...flow, answers: updatedAnswers, currentIdx: nextIdx } });
+      const summary = buildJobDraftSummary(updatedAnswers);
+      return {
+        message: `✅ All done!\n\n${summary}\n\nLooks good? Reply yes to post or no to cancel.`,
+        action: "job_creation_step",
+        payload: { nextStep: "confirm", answers: updatedAnswers },
+      };
+    }
+
+    // Ask next question
+    await updateSessionMemory(session, { jobPostingFlow: { ...flow, answers: updatedAnswers, currentIdx: nextIdx } });
+    const nextQ = flow.questions[nextIdx];
+    const ack = validation.reply ? `${validation.reply}\n\n` : "✅ Got it!\n\n";
+    return {
+      message: `${ack}${nextQ.question}${nextQ.hint ? `\n_(${nextQ.hint})_` : ""}`,
+      action: "job_creation_step",
+      payload: { nextStep: nextQ.field, questionIdx: nextIdx, totalQuestions: flow.questions.length },
+    };
+  }
+
+  // No active job posting flow → general employer AI chat (AI credits deducted)
+  const { reply, paymentRequired } = await aiEmployerGeneralChat(userId, user, lastContent, session);
+  if (paymentRequired) return { message: MSG_AI_CREDITS_EXHAUSTED, action: "payment_required" };
+  return { message: reply || "How can I help you today? 😊", action: "message" };
 }
 
 /* ──────────────────── Local intent detection (fast fallback) ──────────────────── */
@@ -993,11 +1225,14 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
       const profile = await buildUserProfile(user);
       const cmd = routeSlashCommand(lastContent, user, profile);
 
+      // /postJob – start a fresh AI-driven job posting flow (no AI credits for the command itself)
       if (cmd.intent === "employer_post") {
-        const result = await handleEmployerFlow(userId, "", jobDraft, session);
+        const result = await handleEmployerFlow(userId, "", session);
         await appendSessionMessage(session, "assistant", result.message, result.action);
         return result;
       }
+
+      // /findCandidates – no AI credits deducted for the slash command
       if (cmd.intent === "employer_find_candidates") {
         const candResult = await executeFindCandidates(user);
         if (candResult.paymentRequired) {
@@ -1024,6 +1259,8 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
           payload: { candidates: candResult.candidates },
         };
       }
+
+      // /tips – no AI credits deducted for the slash command trigger
       if (cmd.intent === "employer_tips") {
         const { result: tips, paymentRequired } = await aiText(
           "You are Protibha, a job posting expert for Kolkata businesses. Give 3-4 short, actionable tips for writing better job posts that attract more candidates. Write in English only. Be warm and practical.",
@@ -1038,7 +1275,9 @@ export async function handleProtibhaChat(userId, role, messages, jobDraft = null
         return { message: msg, action: "message" };
       }
     }
-    const result = await handleEmployerFlow(userId, lastContent, jobDraft, session);
+
+    // All non-slash messages: active job posting flow or general employer AI chat
+    const result = await handleEmployerFlow(userId, lastContent, session);
     await appendSessionMessage(session, "assistant", result.message, result.action);
     return result;
   }

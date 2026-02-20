@@ -83,7 +83,6 @@ export async function rollbackAiCredits(userId, source, tokens) {
  * @param {number} actualTokens
  */
 export async function deductAiCredits(userId, actualTokens) {
-  console.log({actualTokens, userId})
   const t = Math.max(0, parseInt(actualTokens, 10) || 0);
   if (t === 0) return;
   const user = await User.findById(userId).lean();
@@ -91,7 +90,6 @@ export async function deductAiCredits(userId, actualTokens) {
   const free = Math.max(0, parseInt(user.aiFreeTokensRemaining, 10) ?? 0);
   const fromFree = Math.min(free, t);
   const fromPaid = t - fromFree;
-  console.log({fromFree, fromPaid})
   if (fromFree > 0) {
     await User.findByIdAndUpdate(userId, { $inc: { aiFreeTokensRemaining: -fromFree } });
   }
