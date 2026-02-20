@@ -75,3 +75,27 @@ export async function rollbackAiCredits(userId, source, tokens) {
     await User.findByIdAndUpdate(userId, { $inc: { aiPaidTokensRemaining: t } });
   }
 }
+
+/**
+ * Deduct actual tokens used (free first, then paid). Use after rollback when
+ * settling to real usage.
+ * @param {string} userId
+ * @param {number} actualTokens
+ */
+export async function deductAiCredits(userId, actualTokens) {
+  console.log({actualTokens, userId})
+  const t = Math.max(0, parseInt(actualTokens, 10) || 0);
+  if (t === 0) return;
+  const user = await User.findById(userId).lean();
+  if (!user) return;
+  const free = Math.max(0, parseInt(user.aiFreeTokensRemaining, 10) ?? 0);
+  const fromFree = Math.min(free, t);
+  const fromPaid = t - fromFree;
+  console.log({fromFree, fromPaid})
+  if (fromFree > 0) {
+    await User.findByIdAndUpdate(userId, { $inc: { aiFreeTokensRemaining: -fromFree } });
+  }
+  if (fromPaid > 0) {
+    await User.findByIdAndUpdate(userId, { $inc: { aiPaidTokensRemaining: -fromPaid } });
+  }
+}

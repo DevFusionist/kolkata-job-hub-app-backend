@@ -26,7 +26,7 @@ import { invalidateUserCache } from "../middleware/jwt.js";
 import { rankJobsForSeeker, rankCandidatesForJob } from "./ai.js";
 import { clampAiOutputTokens, enforceAiBudget, truncateAiInput } from "../lib/aiBudget.js";
 import { reserveJobPostingQuota, rollbackJobPostingQuota } from "../lib/employerEntitlements.js";
-import { reserveAiCredits, rollbackAiCredits } from "../lib/aiCredits.js";
+import { reserveAiCredits, rollbackAiCredits, deductAiCredits } from "../lib/aiCredits.js";
 import logger from "../lib/logger.js";
 
 /* ──────────────────── Constants ──────────────────── */
@@ -93,6 +93,9 @@ async function aiJson(systemPrompt, userPrompt, opts = {}) {
       response_format: { type: "json_object" },
       max_tokens: maxTokens,
     });
+    const actualTokens = (r.usage?.total_tokens ?? ((r.usage?.prompt_tokens ?? 0) + (r.usage?.completion_tokens ?? 0))) || estimated;
+    await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    await deductAiCredits(opts.userId, actualTokens);
     const parsed = parseJson(r.choices[0]?.message?.content || "");
     return { result: parsed, paymentRequired: false };
   } catch (e) {
@@ -127,6 +130,9 @@ async function aiText(systemPrompt, userPrompt, opts = {}) {
       temperature: opts.temperature ?? 0.5,
       max_tokens: maxTokens,
     });
+    const actualTokens = (r.usage?.total_tokens ?? ((r.usage?.prompt_tokens ?? 0) + (r.usage?.completion_tokens ?? 0))) || estimated;
+    await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
+    await deductAiCredits(opts.userId, actualTokens);
     const text = (r.choices[0]?.message?.content || "").trim();
     return { result: text, paymentRequired: false };
   } catch (e) {
