@@ -25,6 +25,9 @@ import jwt from "jsonwebtoken";
 const app = express();
 const PORT = process.env.PORT || 8000;
 
+// Trust first proxy (e.g. load balancer, ingress) so req.ip and X-Forwarded-* are correct
+app.set("trust proxy", 1);
+
 // Security headers
 app.use(helmet());
 
@@ -61,6 +64,9 @@ app.use(express.json({ limit: "10mb" }));
 app.use(sanitizeInput);
 app.use(requestLogger);
 
+// Avoid ERR_ERL_UNEXPECTED_X_FORWARDED_FOR when behind a proxy with non-standard headers
+const rateLimitValidate = { validate: { xForwardedForHeader: false } };
+
 // Global rate limiter: 100 requests per minute per IP
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -68,6 +74,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { detail: "Too many requests, please try again later" },
+  ...rateLimitValidate,
 });
 app.use("/api", globalLimiter);
 
@@ -76,6 +83,7 @@ const authLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
   message: { detail: "Too many auth attempts, please try again later" },
+  ...rateLimitValidate,
 });
 app.use("/api/auth", authLimiter);
 
@@ -88,6 +96,7 @@ const userLimiter = rateLimit({
   keyGenerator: (req) => req.userId,
   skip: (req) => !req.userId,
   message: { detail: "Too many requests from this user, please try again later" },
+  ...rateLimitValidate,
 });
 
 // JWT verification: runs on all /api routes, sets req.userId etc. if token present

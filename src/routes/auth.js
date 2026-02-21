@@ -33,11 +33,14 @@ function phoneAwareKey(req) {
   return `${ipKeyGenerator(req.ip)}:${phone}`;
 }
 
+const rateLimitValidate = { validate: { xForwardedForHeader: false } };
+
 const sendOtpLimiter = rateLimit({
   windowMs: OTP_WINDOW_MS,
   max: 3,
   keyGenerator: phoneAwareKey,
   message: { detail: "Too many OTP requests. Please try again later." },
+  ...rateLimitValidate,
 });
 
 const verifyOtpLimiter = rateLimit({
@@ -45,6 +48,7 @@ const verifyOtpLimiter = rateLimit({
   max: 8,
   keyGenerator: phoneAwareKey,
   message: { detail: "Too many OTP verification attempts. Please try again later." },
+  ...rateLimitValidate,
 });
 
 const loginLimiter = rateLimit({
@@ -52,6 +56,7 @@ const loginLimiter = rateLimit({
   max: 20,
   keyGenerator: phoneAwareKey,
   message: { detail: "Too many login attempts. Please try again later." },
+  ...rateLimitValidate,
 });
 
 const setMpinLimiter = rateLimit({
@@ -59,6 +64,7 @@ const setMpinLimiter = rateLimit({
   max: 8,
   keyGenerator: (req) => `${ipKeyGenerator(req.ip)}:${String(req.userId || req.headers["x-mpin-reset-token"] || "unknown")}`,
   message: { detail: "Too many MPIN reset attempts. Please try again later." },
+  ...rateLimitValidate,
 });
 
 function getMpinFailure(phone) {
