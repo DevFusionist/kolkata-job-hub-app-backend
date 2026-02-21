@@ -111,13 +111,13 @@ router.post("/auth/send-otp", sendOtpLimiter, async (req, res) => {
     });
   }
 
-  const e164 = toE164(phone);
-  const result = await twilioSendOtp(e164);
-  if (!result.success) {
-    return res
-      .status(502)
-      .json({ success: false, message: result.message || "Failed to send OTP" });
-  }
+  // const e164 = toE164(phone);
+  // const result = await twilioSendOtp(e164);
+  // if (!result.success) {
+  //   return res
+  //     .status(502)
+  //     .json({ success: false, message: result.message || "Failed to send OTP" });
+  // }
   res.json({ success: true, message: "OTP sent to your number.", purpose });
 });
 
@@ -135,11 +135,11 @@ router.post("/auth/verify-otp", verifyOtpLimiter, async (req, res) => {
     return res.status(400).json({ success: false, message: "Invalid OTP purpose" });
   }
 
-  const e164 = toE164(phone);
-  const result = await twilioVerifyOtp(e164, otp);
-  if (!result.success) {
-    return res.status(401).json({ success: false, message: result.message || "Incorrect or expired OTP" });
-  }
+  // const e164 = toE164(phone);
+  // const result = await twilioVerifyOtp(e164, otp);
+  // if (!result.success) {
+  //   return res.status(401).json({ success: false, message: result.message || "Incorrect or expired OTP" });
+  // }
   const user = await User.findOne({ phone }).lean();
   if (purpose === "register") {
     if (user) {

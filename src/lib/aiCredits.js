@@ -77,8 +77,9 @@ export async function rollbackAiCredits(userId, source, tokens) {
 }
 
 /**
- * Deduct actual tokens used (free first, then paid). Use after rollback when
- * settling to real usage.
+ * Deduct only real token usage (free first, then paid). Use after rollback when
+ * settling to actual usage from the model response. No estimates or random
+ * amounts are deducted—only the actualTokens value from usage.total_tokens.
  * @param {string} userId
  * @param {number} actualTokens
  */

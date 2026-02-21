@@ -70,6 +70,16 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: "Fresher",
     },
+    education: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    industry: {
+      type: String,
+      trim: true,
+      default: null,
+    },
     languages: {
       type: [String],
       default: ["Bengali", "Hindi"],

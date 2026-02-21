@@ -95,7 +95,9 @@ async function aiJson(systemPrompt, userPrompt, opts = {}) {
     });
     const actualTokens = (r.usage?.total_tokens ?? ((r.usage?.prompt_tokens ?? 0) + (r.usage?.completion_tokens ?? 0))) || estimated;
     await rollbackAiCredits(opts.userId, reservation.source, reservation.tokensReserved);
-    await deductAiCredits(opts.userId, actualTokens);
+    if (opts.charge !== false) {
+      await deductAiCredits(opts.userId, actualTokens);
+    }
     const parsed = parseJson(r.choices[0]?.message?.content || "");
     return { result: parsed, paymentRequired: false };
   } catch (e) {
@@ -299,7 +301,7 @@ Current message: "${userMessage}"
 
 Return JSON:`;
 
-  const { result, paymentRequired } = await aiJson(INTENT_SYSTEM, userPrompt, { userId, maxTokens: 180 });
+  const { result, paymentRequired } = await aiJson(INTENT_SYSTEM, userPrompt, { userId, maxTokens: 180, charge: false });
   if (paymentRequired) return { intentResult: null, paymentRequired: true };
   return { intentResult: result || { intent: "general", filters: {}, apply_target: null, raw_search: userMessage }, paymentRequired: false };
 }

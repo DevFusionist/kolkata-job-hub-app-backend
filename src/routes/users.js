@@ -64,6 +64,17 @@ router.post("/users", async (req, res) => {
   const skills = cleanStringArray(body.skills, { maxItems: MAX_SKILLS, maxItemLen: 60 });
   const languages = cleanStringArray(body.languages, { maxItems: MAX_LANGUAGES, maxItemLen: 40 });
   const experience = cleanString(body.experience, 40) || "Fresher";
+  const education = cleanString(body.education, 60) || "";
+  const industry = body.role === "employer" ? (cleanString(body.industry, 120) || null) : null;
+
+  // Map expectedSalary (seeker) to preferredSalary { min, max }
+  let preferredSalary = { min: 0, max: 0 };
+  if (body.role === "seeker" && body.expectedSalary != null) {
+    const num = parseInt(String(body.expectedSalary).replace(/\D/g, ""), 10);
+    if (Number.isFinite(num) && num > 0) {
+      preferredSalary = { min: num, max: num };
+    }
+  }
 
   const existing = await User.findOne({ phone: body.phone });
   if (existing) {
@@ -76,10 +87,13 @@ router.post("/users", async (req, res) => {
       name,
       role: body.role,
       businessName: businessName || null,
+      industry: industry || null,
       location,
       skills,
       languages: languages.length ? languages : ["Bengali", "Hindi"],
       experience,
+      education: education || "",
+      preferredSalary,
       freeJobsRemaining: body.role === "employer" ? FREE_JOB_TRIAL_LIMIT : 0,
       paidJobsRemaining: 0,
       subscriptionPlan: "none",
@@ -127,6 +141,8 @@ router.put("/users/:userId", requireUser, async (req, res) => {
       "skills",
       "languages",
       "experience",
+      "education",
+      "industry",
       "preferredLanguage",
       "preferredSalary",
     ];
@@ -141,6 +157,8 @@ router.put("/users/:userId", requireUser, async (req, res) => {
     if (safeFields.businessName !== undefined) safeFields.businessName = cleanString(safeFields.businessName, MAX_BUSINESS_LEN);
     if (safeFields.location !== undefined) safeFields.location = cleanString(safeFields.location, MAX_LOCATION_LEN);
     if (safeFields.experience !== undefined) safeFields.experience = cleanString(safeFields.experience, 40);
+    if (safeFields.education !== undefined) safeFields.education = cleanString(safeFields.education, 60);
+    if (safeFields.industry !== undefined) safeFields.industry = cleanString(safeFields.industry, 120) || null;
     if (safeFields.skills !== undefined) {
       safeFields.skills = cleanStringArray(safeFields.skills, { maxItems: MAX_SKILLS, maxItemLen: 60 });
     }
