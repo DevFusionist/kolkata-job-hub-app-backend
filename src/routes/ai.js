@@ -1,9 +1,9 @@
 import { Router } from "express";
-import { User, Job, Portfolio, ChatSession, CATEGORIES } from "../models/index.js";
+import { User, Job, ChatSession } from "../models/index.js";
 import { serializeDoc } from "../utils.js";
-import { requireSeeker, requireUser } from "../middleware/auth.js";
-import { invalidateUserCache } from "../middleware/jwt.js";
-import { analyzePortfolio, rankJobsForSeeker, rankCandidatesForJob } from "../services/ai.js";
+import { requireUser } from "../middleware/auth.js";
+
+import { rankJobsForSeeker, rankCandidatesForJob } from "../services/ai.js";
 import { handleProtibhaChat } from "../services/protibhaChat.js";
 import logger from "../lib/logger.js";
 import { asyncHandler } from "../lib/asyncHandler.js";
@@ -14,11 +14,6 @@ const MAX_CHAT_MESSAGES = 40;
 const MAX_CHAT_MESSAGE_CHARS = 500;
 const MAX_JOB_DRAFT_FIELD_CHARS = 300;
 const MAX_LAST_JOBS = 30;
-const MAX_PORTFOLIO_TEXT = 8000;
-const MAX_PROJECTS = 20;
-const MAX_LINKS = 20;
-const MAX_LINK_CHARS = 200;
-const MAX_PROJECT_FIELD_CHARS = 200;
 
 function sanitizeJob(job) {
   const out = serializeDoc(job);
@@ -82,109 +77,6 @@ router.post("/ai/chat", requireUser, async (req, res) => {
       message: "Something went wrong. Please try again.",
       action: "error",
     });
-  }
-});
-
-router.post("/ai/analyze-portfolio", requireSeeker, async (req, res) => {
-  const seekerId = req.seekerId;
-  const user = req.seeker;
-  const rawText = String(req.body?.rawText || "").slice(0, MAX_PORTFOLIO_TEXT);
-  const projects = Array.isArray(req.body?.projects)
-    ? req.body.projects
-      .slice(0, MAX_PROJECTS)
-      .map((p) => String(p || "").slice(0, MAX_PROJECT_FIELD_CHARS))
-      .filter(Boolean)
-    : [];
-  const links = Array.isArray(req.body?.links)
-    ? req.body.links
-      .slice(0, MAX_LINKS)
-      .map((l) => String(l || "").slice(0, MAX_LINK_CHARS))
-      .filter(Boolean)
-    : [];
-
-  const result = await analyzePortfolio(rawText, projects, links, { userId: seekerId });
-  if (result.paymentRequired) {
-    return res.status(402).json({
-      message: "AI credits exhausted. Please purchase more to use this feature.",
-      action: "payment_required",
-      detail: "Payment required",
-    });
-  }
-  // Upsert single portfolio per seeker (update existing or create one)
-  await Portfolio.findOneAndUpdate(
-    { seeker: seekerId },
-    {
-      $set: {
-        rawText: rawText.slice(0, 10000),
-        projects: projects.map((name) => ({ name })),
-        links,
-      },
-    },
-    { upsert: true, new: true }
-  );
-
-  const existing = (user.skills || []).map((s) => (typeof s === "string" ? s.trim() : String(s).trim())).filter(Boolean);
-  const existingSkills = new Set(existing);
-  for (const s of result.skills) {
-    const skill = typeof s === "string" ? s.trim() : String(s ?? "").trim();
-    if (skill && !existingSkills.has(skill)) existingSkills.add(skill);
-  }
-  const mergedSkills = [...existingSkills].slice(0, 30);
-
-  // Merge aiExtracted with existing so we don't lose earlier extracted data
-  const existingAi = user.aiExtracted || {};
-  const existingAiSkills = (existingAi.skills || []).map((s) => (typeof s === "string" ? s.trim() : String(s).trim())).filter(Boolean);
-  const aiSkillsSet = new Set(existingAiSkills);
-  for (const s of result.skills) {
-    const skill = typeof s === "string" ? s.trim() : String(s ?? "").trim();
-    if (skill) aiSkillsSet.add(skill);
-  }
-  const mergedAiExtracted = {
-    skills: [...aiSkillsSet].slice(0, 30),
-    experience: result.experience || existingAi.experience || "Fresher",
-    category: result.category || existingAi.category || "Other",
-    score: typeof result.score === "number" ? result.score : (existingAi.score ?? 0),
-  };
-
-  await User.findByIdAndUpdate(seekerId, {
-    $set: { aiExtracted: mergedAiExtracted, skills: mergedSkills },
-  });
-  invalidateUserCache(seekerId);
-
-  res.json({
-    skills: result.skills,
-    mergedSkills,
-    experience: result.experience,
-    category: result.category,
-    score: result.score,
-    feedback: result.feedback,
-  });
-});
-
-/**
- * Get suggested skills from active jobs in the given category (no hardcoding).
- * Query: ?category=Delivery (optional; defaults to Other).
- * Aggregates skills from Job documents and returns most frequent ones.
- */
-router.get("/ai/suggested-skills", requireSeeker, async (req, res) => {
-  const category = String(req.query.category || "Other").trim();
-  const validCategory = CATEGORIES.includes(category) ? category : "Other";
-  try {
-    const aggregated = await Job.aggregate([
-      { $match: { category: validCategory, status: "active" } },
-      { $unwind: "$skills" },
-      { $match: { skills: { $exists: true, $ne: "" } } },
-      { $group: { _id: "$skills", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 30 },
-    ]);
-    const skills = aggregated
-      .map((r) => (r._id != null ? String(r._id).trim() : ""))
-      .filter(Boolean);
-    res.json({ skills, category: validCategory });
-  } catch (e) {
-    logger.warn({ err: e.message, category: validCategory }, "Suggested skills aggregation failed");
-    res.json({ skills: [], category: validCategory });
   }
 });
 

@@ -5,3 +5,4 @@ export { default as Message } from "./Message.js";
 export { default as Portfolio } from "./Portfolio.js";
 export { default as Transaction } from "./Transaction.js";
 export { default as ChatSession } from "./ChatSession.js";
+export { default as ImprovementLog } from "./ImprovementLog.js";

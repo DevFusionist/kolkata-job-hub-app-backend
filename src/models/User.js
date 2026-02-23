@@ -99,6 +99,47 @@ const userSchema = new mongoose.Schema(
       enum: ["en", "bn"],
       default: "en",
     },
+
+    // AI Career Copilot fields
+    careerGoal: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    workType: {
+      type: String,
+      enum: ["", "office", "remote", "hybrid", "field"],
+      default: "",
+    },
+    hireScore: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    trustScore: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    profileScore: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    copilotAudit: {
+      strengths: { type: [String], default: [] },
+      weaknesses: { type: [String], default: [] },
+      hiringProbability: { type: Number, default: 0 },
+      salaryPotential: { type: String, default: "" },
+      lastAuditAt: { type: Date, default: null },
+    },
+    photoVerified: { type: Boolean, default: false },
+    phoneVerified: { type: Boolean, default: true },
+    idVerified: { type: Boolean, default: false },
+    aiOptimized: { type: Boolean, default: false },
   },
   {
     timestamps: true,
