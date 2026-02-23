@@ -90,13 +90,18 @@ export async function analyzePortfolio(rawText, projects = [], links = [], opts 
 5. feedback: 1-2 sentence improvement tips in English only (skill gap, what to add). Be encouraging. Do not use Bengali or Hindi.
 Output ONLY valid JSON with keys: skills, experience, category, score, feedback.`;
   const { result: data, paymentRequired } = await chatJson(system, `${content}\nReturn JSON only:`, { userId: opts.userId, maxTokens: 220 });
+  console.log("data", data);
   if (paymentRequired) return { ...defaultOut, paymentRequired: true };
   if (!data) return defaultOut;
-  let skills = data.skills || [];
+  let skills = data.skills ?? data.Skills ?? [];
   if (typeof skills === "string") skills = skills.split(",").map((s) => s.trim()).filter(Boolean);
   else if (!Array.isArray(skills)) skills = [];
+  // Normalize to array of strings (AI sometimes returns objects like { name: "React" })
+  const normalizedSkills = skills
+    .map((s) => (typeof s === "string" ? s.trim() : (s?.name ?? s?.skill ?? String(s ?? "")).trim()))
+    .filter(Boolean);
   return {
-    skills: skills.slice(0, 20),
+    skills: normalizedSkills.slice(0, 20),
     experience: data.experience || "Fresher",
     category: data.category || "Other",
     score: Math.min(100, Math.max(0, parseInt(data.score, 10) || 0)),

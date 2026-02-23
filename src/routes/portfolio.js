@@ -187,23 +187,33 @@ router.post(
       });
     }
 
-    // 5. Update user with AI-extracted skills
+    // 5. Update user with AI-extracted skills (normalize to strings)
+    let mergedSkills = null;
     if (aiResult?.skills?.length) {
-      const user = await User.findById(seekerId);
-      if (user) {
-        const existingSkills = new Set(user.skills || []);
+      const dbUser = await User.findById(seekerId);
+      if (dbUser) {
+        const existing = (dbUser.skills || []).map((s) => (typeof s === "string" ? s.trim() : String(s).trim())).filter(Boolean);
+        const existingSkills = new Set(existing);
         for (const s of aiResult.skills) {
-          if (s && !existingSkills.has(s)) existingSkills.add(s);
+          const skill = typeof s === "string" ? s.trim() : String(s ?? "").trim();
+          if (skill && !existingSkills.has(skill)) existingSkills.add(skill);
         }
-        user.skills = [...existingSkills].slice(0, 30);
-        user.aiExtracted = {
-          ...user.aiExtracted,
-          skills: aiResult.skills,
-          experience: aiResult.experience,
-          category: aiResult.category,
-          score: aiResult.score,
+        mergedSkills = [...existingSkills].slice(0, 30);
+        dbUser.skills = mergedSkills;
+        const existingAi = dbUser.aiExtracted || {};
+        const existingAiSkills = (existingAi.skills || []).map((s) => (typeof s === "string" ? String(s).trim() : String(s).trim())).filter(Boolean);
+        const aiSkillsSet = new Set(existingAiSkills);
+        for (const s of aiResult.skills) {
+          const skill = typeof s === "string" ? s.trim() : String(s ?? "").trim();
+          if (skill) aiSkillsSet.add(skill);
+        }
+        dbUser.aiExtracted = {
+          skills: [...aiSkillsSet].slice(0, 30),
+          experience: aiResult.experience || existingAi.experience || "",
+          category: aiResult.category || existingAi.category || "",
+          score: typeof aiResult.score === "number" ? aiResult.score : (existingAi.score ?? 0),
         };
-        await user.save();
+        await dbUser.save();
         invalidateUserCache(seekerId);
       }
     }
@@ -214,6 +224,7 @@ router.post(
       fileName: file.originalname,
       extractedText: extractedText ? extractedText.slice(0, 500) + (extractedText.length > 500 ? "..." : "") : null,
       aiAnalysis: aiResult || null,
+      mergedSkills: mergedSkills ?? undefined,
       portfolio: portfolio.toJSON(),
     });
   })
