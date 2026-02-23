@@ -119,7 +119,7 @@ router.post("/ai/analyze-portfolio", requireSeeker, async (req, res) => {
   await Portfolio.create({
     seeker: seekerId,
     rawText,
-    projects,
+    projects: projects.map((name) => ({ name })),
     links,
   });
 
