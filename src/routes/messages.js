@@ -74,7 +74,7 @@ router.get("/messages/:userId", requireUser, async (req, res) => {
       .limit(limit)
       .lean();
 
-    res.json(messages.map(serializeDoc));
+    res.json(messages.map((m) => ({ ...serializeDoc(m), timestamp: m.createdAt })));
   } catch (e) {
     if (e.name === "TypeError" || e.name === "CastError") {
       return res.status(400).json({ detail: "Invalid user ID" });
@@ -140,7 +140,7 @@ router.get("/messages/conversations/:userId", requireUser, async (req, res) => {
         return {
           userId: c._id.toString(),
           userName: other.name,
-          lastMessage: serializeDoc(c.lastMessage),
+          lastMessage: (() => { const lm = serializeDoc(c.lastMessage); return lm ? { ...lm, timestamp: lm.timestamp ?? lm.createdAt } : lm; })(),
         };
       })
       .filter(Boolean);
