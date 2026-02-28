@@ -11,6 +11,7 @@ const MPIN_RESET_TOKEN_EXPIRES_IN = "10m";
 
 // In-memory TTL cache for User lookups to avoid DB hit on every request
 const USER_CACHE_TTL_MS = 60_000; // 60 seconds
+const USER_CACHE_MAX = 2000;
 const userCache = new Map(); // userId -> { user, expiresAt }
 
 function getCachedUser(userId) {
@@ -25,11 +26,18 @@ function getCachedUser(userId) {
 
 function setCachedUser(userId, user) {
   userCache.set(userId, { user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
-  // Evict stale entries periodically (keep cache bounded)
-  if (userCache.size > 5000) {
+  // Keep cache bounded and evict stale entries first.
+  if (userCache.size > USER_CACHE_MAX) {
     const now = Date.now();
     for (const [key, val] of userCache) {
       if (now > val.expiresAt) userCache.delete(key);
+      if (userCache.size <= USER_CACHE_MAX) break;
+    }
+    // Fallback eviction by insertion order if still over the limit.
+    while (userCache.size > USER_CACHE_MAX) {
+      const oldestKey = userCache.keys().next().value;
+      if (!oldestKey) break;
+      userCache.delete(oldestKey);
     }
   }
 }

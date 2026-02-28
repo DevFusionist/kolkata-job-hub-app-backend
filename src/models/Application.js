@@ -55,6 +55,7 @@ const applicationSchema = new mongoose.Schema(
 // Prevent duplicate applications
 applicationSchema.index({ job: 1, seeker: 1 }, { unique: true });
 applicationSchema.index({ seeker: 1, appliedDate: -1 });
+applicationSchema.index({ job: 1, appliedDate: -1 });
 
 export { APPLICATION_STATUSES };
 export default mongoose.model("Application", applicationSchema);

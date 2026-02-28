@@ -18,12 +18,9 @@ router.post("/applications", requireSeeker, async (req, res) => {
   }
 
   try {
-    const job = await Job.findById(jobId);
+    const job = await Job.findById(jobId).select("_id status").lean();
     if (!job) return res.status(404).json({ detail: "Job not found" });
     if (job.status !== "active") return res.status(400).json({ detail: "Job is no longer accepting applications" });
-
-    const existing = await Application.findOne({ job: jobId, seeker: seekerId });
-    if (existing) return res.status(400).json({ detail: "Already applied to this job" });
 
     const application = await Application.create({
       job: jobId,
@@ -36,8 +33,7 @@ router.post("/applications", requireSeeker, async (req, res) => {
       appliedDate: new Date(),
     });
 
-    job.applicationsCount = (job.applicationsCount || 0) + 1;
-    await job.save();
+    await Job.updateOne({ _id: jobId }, { $inc: { applicationsCount: 1 } });
 
     res.json(application.toJSON());
   } catch (e) {
@@ -56,6 +52,7 @@ router.get("/applications/job/:jobId", requireEmployer, async (req, res) => {
     }
 
     const apps = await Application.find({ job: req.params.jobId })
+      .select("job seeker seekerName seekerPhone seekerSkills coverLetter status appliedDate createdAt updatedAt")
       .sort({ appliedDate: -1 })
       .limit(100)
       .lean();
@@ -72,6 +69,7 @@ router.get("/applications/seeker/:seekerId", requireSeeker, async (req, res) => 
   }
   try {
     const apps = await Application.find({ seeker: req.params.seekerId })
+      .select("job seeker seekerName seekerPhone seekerSkills coverLetter status appliedDate createdAt updatedAt")
       .sort({ appliedDate: -1 })
       .limit(100)
       .lean();

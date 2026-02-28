@@ -28,7 +28,7 @@ router.post("/messages", requireUser, async (req, res) => {
   }
 
   try {
-    const receiver = await User.findById(receiverId).lean();
+    const receiver = await User.findById(receiverId).select("_id").lean();
     if (!receiver) return res.status(404).json({ detail: "Receiver not found" });
   } catch {
     return res.status(400).json({ detail: "Invalid receiverId" });
@@ -129,7 +129,7 @@ router.get("/messages/conversations/:userId", requireUser, async (req, res) => {
 
     const userIds = convs.map(c => c._id).filter(Boolean);
     const users = userIds.length
-      ? await User.find({ _id: { $in: userIds } }).lean()
+      ? await User.find({ _id: { $in: userIds } }).select("_id name").lean()
       : [];
     const userMap = new Map(users.map(u => [u._id.toString(), u]));
 

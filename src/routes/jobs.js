@@ -6,6 +6,7 @@ import { invalidateUserCache } from "../middleware/jwt.js";
 import { reserveJobPostingQuota, rollbackJobPostingQuota } from "../lib/employerEntitlements.js";
 
 const router = Router();
+const JOB_LIST_PROJECTION = "title category description salary salaryMin salaryMax location jobType experience education languages skills employerId employerName businessName postedDate status applicationsCount isPaid createdAt updatedAt";
 
 function sanitizeJobResponse(job, { includeEmployerPhone = false } = {}) {
   const out = serializeDoc(job);
@@ -107,6 +108,8 @@ router.post("/jobs", requireEmployer, async (req, res) => {
 router.get("/jobs", async (req, res) => {
   const q = req.query;
   const filter = { status: "active" };
+  let sort = { postedDate: -1 };
+  const limit = Math.min(100, Math.max(1, parseInt(String(q.limit || "50"), 10) || 50));
   if (q.category) filter.category = q.category;
   if (q.location) {
     const escaped = q.location.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -121,13 +124,25 @@ router.get("/jobs", async (req, res) => {
     filter.skills = new RegExp(escaped, "i");
   }
   if (q.search) {
-    const escaped = q.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    filter.$or = [
-      { title: new RegExp(escaped, "i") },
-      { description: new RegExp(escaped, "i") },
-    ];
+    filter.$text = { $search: String(q.search) };
+    sort = { score: { $meta: "textScore" }, postedDate: -1 };
   }
-  const jobs = await Job.find(filter).sort({ postedDate: -1 }).limit(100).lean();
+  let jobs = await Job.find(filter)
+    .select(q.search ? { ...Object.fromEntries(JOB_LIST_PROJECTION.split(" ").map((f) => [f, 1])), score: { $meta: "textScore" } } : JOB_LIST_PROJECTION)
+    .sort(sort)
+    .limit(limit)
+    .lean();
+
+  if (!jobs.length && q.search) {
+    // Fallback for fuzzy substring behavior when text index returns nothing.
+    const escaped = String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const fallbackFilter = {
+      ...filter,
+      $or: [{ title: new RegExp(escaped, "i") }, { description: new RegExp(escaped, "i") }],
+    };
+    delete fallbackFilter.$text;
+    jobs = await Job.find(fallbackFilter).select(JOB_LIST_PROJECTION).sort({ postedDate: -1 }).limit(limit).lean();
+  }
   res.json(jobs.map((j) => sanitizeJobResponse(j)));
 });
 
@@ -149,6 +164,7 @@ router.get("/jobs/employer/:employerId", requireEmployer, async (req, res) => {
   }
   try {
     const jobs = await Job.find({ employerId: req.params.employerId })
+      .select(JOB_LIST_PROJECTION)
       .sort({ postedDate: -1 })
       .limit(100)
       .lean();

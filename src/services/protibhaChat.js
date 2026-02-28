@@ -40,6 +40,10 @@ const MIN_DESCRIPTION_LEN = 8;
 const DB_LIMIT = 30;
 const RANK_LIMIT = 10;
 const MAX_SESSION_MESSAGES = 200;
+const USER_PROFILE_CACHE_TTL_MS = 30_000;
+const USER_PROFILE_CACHE_MAX = 2000;
+const userProfileCache = new Map(); // userId -> { profile, expiresAt }
+const JOB_LIST_PROJECTION = "title category description salary salaryMin salaryMax location jobType experience education languages skills employerId employerName businessName postedDate status applicationsCount isPaid createdAt updatedAt";
 
 // User-facing messages: all in English for consistency (no mixed Hindi/Bengali).
 const MSG_AI_CREDITS_EXHAUSTED = "Your AI credits are used up. Please buy more to continue using AI.";
@@ -160,6 +164,42 @@ function normalize(text) {
     .replace(/\s+/g, " ").trim();
 }
 
+function getCachedUserProfile(userId) {
+  const key = String(userId || "");
+  if (!key) return null;
+  const entry = userProfileCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    userProfileCache.delete(key);
+    return null;
+  }
+  return entry.profile;
+}
+
+function setCachedUserProfile(userId, profile) {
+  const key = String(userId || "");
+  if (!key) return;
+  userProfileCache.set(key, { profile, expiresAt: Date.now() + USER_PROFILE_CACHE_TTL_MS });
+  if (userProfileCache.size > USER_PROFILE_CACHE_MAX) {
+    const now = Date.now();
+    for (const [cacheKey, val] of userProfileCache) {
+      if (now > val.expiresAt) userProfileCache.delete(cacheKey);
+      if (userProfileCache.size <= USER_PROFILE_CACHE_MAX) break;
+    }
+    while (userProfileCache.size > USER_PROFILE_CACHE_MAX) {
+      const oldestKey = userProfileCache.keys().next().value;
+      if (!oldestKey) break;
+      userProfileCache.delete(oldestKey);
+    }
+  }
+}
+
+function invalidateCachedUserProfile(userId) {
+  const key = String(userId || "");
+  if (!key) return;
+  userProfileCache.delete(key);
+}
+
 function toAsciiDigits(text) {
   // Supports Bengali (০-৯) and Devanagari (०-९) numerals.
   const map = {
@@ -209,6 +249,10 @@ async function updateSessionMemory(session, updates) {
 /* ──────────────────── User profile helpers (enhanced) ──────────────────── */
 
 async function buildUserProfile(user) {
+  const userId = user?._id?.toString?.() || user?.id?.toString?.();
+  const cached = getCachedUserProfile(userId);
+  if (cached) return cached;
+
   const skills = [...new Set([...(user.skills || []), ...(user.aiExtracted?.skills || [])])];
   const experience = user.aiExtracted?.experience || user.experience || "Fresher";
   const location = user.location || "";
@@ -216,32 +260,33 @@ async function buildUserProfile(user) {
   const preferredSalary = user.preferredSalary || { min: 0, max: 0 };
   const preferredLanguage = user.preferredLanguage || "en";
 
-  // Fetch portfolio skills (long-term memory)
-  let portfolioSkills = [];
-  try {
-    const portfolio = await Portfolio.findOne({ seeker: user._id })
-      .sort({ createdAt: -1 }).lean();
-    if (portfolio?.rawText) {
-      portfolioSkills = portfolio.rawText.split(/[,\n;]+/)
-        .map(s => s.trim()).filter(s => s.length > 1 && s.length < 50).slice(0, 10);
-    }
-  } catch { /* ignore */ }
-
-  // Fetch previous applications (long-term memory)
-  let previousApps = [];
-  try {
-    previousApps = await Application.find({ seeker: user._id })
+  // Fetch long-term memory in parallel to reduce chat latency.
+  const [portfolio, previousApps] = await Promise.all([
+    Portfolio.findOne({ seeker: user._id })
+      .sort({ createdAt: -1 })
+      .select("rawText")
+      .lean()
+      .catch(() => null),
+    Application.find({ seeker: user._id })
       .sort({ appliedDate: -1 })
       .limit(20)
       .populate("job", "title category location salary")
-      .lean();
-  } catch { /* ignore */ }
+      .select("job appliedDate")
+      .lean()
+      .catch(() => []),
+  ]);
+
+  let portfolioSkills = [];
+  if (portfolio?.rawText) {
+    portfolioSkills = portfolio.rawText.split(/[,\n;]+/)
+      .map(s => s.trim()).filter(s => s.length > 1 && s.length < 50).slice(0, 10);
+  }
 
   const appliedJobIds = new Set(previousApps.map(a => a.job?._id?.toString()).filter(Boolean));
   const appliedCategories = [...new Set(previousApps.map(a => a.job?.category).filter(Boolean))];
   const appliedLocations = [...new Set(previousApps.map(a => a.job?.location).filter(Boolean))];
 
-  return {
+  const profile = {
     skills,
     experience,
     location,
@@ -254,6 +299,8 @@ async function buildUserProfile(user) {
     appliedLocations,
     previousAppsCount: previousApps.length,
   };
+  setCachedUserProfile(userId, profile);
+  return profile;
 }
 
 /* ──────────────────── STAGE 1: Intent + Filter extraction (AI Call 1) ──────────────────── */
@@ -369,6 +416,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
   // Highest paying: sort by salaryMin descending
   if (searchType === "highest_paying") {
     const jobsRaw = await Job.find(query)
+      .select(JOB_LIST_PROJECTION)
       .sort({ salaryMin: -1, postedDate: -1 })
       .limit(dbLimit)
       .lean();
@@ -396,7 +444,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
         ];
       }
     }
-    const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
+    const jobsRaw = await Job.find(query).select(JOB_LIST_PROJECTION).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
     if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
@@ -418,7 +466,7 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
       orConditions.push({ skills: { $in: userProfile.skills } });
     }
     if (orConditions.length) query.$or = orConditions;
-    const jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
+    const jobsRaw = await Job.find(query).select(JOB_LIST_PROJECTION).sort(sort).limit(dbLimit).lean();
     for (const j of jobsRaw) j.id = j._id.toString();
     const rankedIds = await rankJobsForSeeker(user, jobsRaw, rankLimit, { userId: user?._id?.toString?.() || user?.id });
     if (rankedIds && rankedIds.paymentRequired) return { jobs: [], paymentRequired: true };
@@ -471,13 +519,13 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
     query.location = new RegExp(escapeRegex(filters.location).replace(/\s+/g, "\\s+"), "i");
   }
 
-  let jobsRaw = await Job.find(query).sort(sort).limit(dbLimit).lean();
+  let jobsRaw = await Job.find(query).select(JOB_LIST_PROJECTION).sort(sort).limit(dbLimit).lean();
 
   // Fallback: location was too strict, retry without it
   if (!jobsRaw.length && filters.location && query.$or) {
     const relaxed = { ...query };
     delete relaxed.location;
-    jobsRaw = await Job.find(relaxed).sort(sort).limit(dbLimit).lean();
+    jobsRaw = await Job.find(relaxed).select(JOB_LIST_PROJECTION).sort(sort).limit(dbLimit).lean();
   }
 
   if (!jobsRaw.length) return { jobs: [], paymentRequired: false };
@@ -495,7 +543,10 @@ async function executeJobSearch(user, filters, searchType, userProfile, { dbLimi
 
 async function executeFindCandidates(user) {
   const employerJobs = await Job.find({ employerId: user._id.toString(), status: "active" })
-    .sort({ postedDate: -1 }).limit(5).lean();
+    .select("title category skills location salary postedDate status")
+    .sort({ postedDate: -1 })
+    .limit(5)
+    .lean();
 
   if (!employerJobs.length) {
     return { candidates: [], message: "You have no active jobs. Please post a job first!" };
@@ -639,7 +690,9 @@ async function fetchActiveJobsByIds(ids) {
   const validIds = ids.filter((id) => /^[a-f\d]{24}$/i.test(id));
   if (!validIds.length) return [];
   const objectIds = validIds.map((id) => toObjectId(id));
-  const jobsRaw = await Job.find({ _id: { $in: objectIds }, status: "active" }).lean();
+  const jobsRaw = await Job.find({ _id: { $in: objectIds }, status: "active" })
+    .select(JOB_LIST_PROJECTION)
+    .lean();
   for (const j of jobsRaw) j.id = j._id.toString();
   return jobsRaw;
 }
@@ -673,34 +726,58 @@ async function executeApply(userId, user, applyTarget, contextJobIds) {
   }
 
   const toApply = isAll ? jobs : [jobs[0]];
+  const activeJobs = toApply.filter((job) => job.status === "active");
+  const targetJobIds = activeJobs.map((job) => job._id || job.id).filter(Boolean);
+  const now = new Date();
+
+  const existing = await Application.find({
+    seeker: userId,
+    job: { $in: targetJobIds },
+  }).select("job").lean();
+  const existingIds = new Set(existing.map((a) => a.job?.toString()).filter(Boolean));
+
+  const docsToInsert = activeJobs
+    .filter((job) => !existingIds.has((job._id || job.id).toString()))
+    .map((job) => ({
+      job: job._id || job.id,
+      seeker: userId,
+      seekerName: user.name,
+      seekerPhone: user.phone,
+      seekerSkills: user.skills || [],
+      coverLetter: "",
+      status: "pending",
+      appliedDate: now,
+    }));
+
   let applied = 0;
-  let alreadyApplied = 0;
-  let failed = 0;
-
-  for (const job of toApply) {
+  let alreadyApplied = existingIds.size;
+  let failed = toApply.length - activeJobs.length;
+  let insertedJobIds = [];
+  if (docsToInsert.length) {
     try {
-      if (job.status !== "active") { failed++; continue; }
-
-      const existing = await Application.findOne({ job: job._id || job.id, seeker: userId });
-      if (existing) { alreadyApplied++; continue; }
-
-      await Application.create({
-        job: job._id || job.id,
-        seeker: userId,
-        seekerName: user.name,
-        seekerPhone: user.phone,
-        seekerSkills: user.skills || [],
-        coverLetter: "",
-        status: "pending",
-        appliedDate: new Date(),
-      });
-
-      await Job.findByIdAndUpdate(job._id || job.id, { $inc: { applicationsCount: 1 } });
-      applied++;
+      const inserted = await Application.insertMany(docsToInsert, { ordered: false });
+      insertedJobIds = inserted.map((d) => d.job).filter(Boolean);
+      applied = insertedJobIds.length;
     } catch (e) {
-      if (e.code === 11000) { alreadyApplied++; continue; }
-      failed++;
+      // Partial success can happen with ordered:false, so derive inserted IDs from error payload.
+      const partial = Array.isArray(e?.insertedDocs) ? e.insertedDocs : [];
+      insertedJobIds = partial.map((d) => d.job).filter(Boolean);
+      applied = insertedJobIds.length;
+      if (e?.writeErrors?.length) {
+        const dupCount = e.writeErrors.filter((w) => w.code === 11000).length;
+        alreadyApplied += dupCount;
+        failed += (e.writeErrors.length - dupCount);
+      } else {
+        failed += Math.max(0, docsToInsert.length - applied);
+      }
     }
+  }
+  if (insertedJobIds.length) {
+    await Job.updateMany(
+      { _id: { $in: insertedJobIds } },
+      { $inc: { applicationsCount: 1 } },
+    );
+    invalidateCachedUserProfile(userId);
   }
 
   return {

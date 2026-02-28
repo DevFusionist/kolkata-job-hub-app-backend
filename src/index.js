@@ -190,6 +190,12 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (ws, req) => {
   const userId = req._authenticatedUserId;
   if (userId) {
+    const existing = connections.get(userId);
+    if (existing && existing !== ws) {
+      try {
+        existing.close(1000, "Replaced by a newer connection");
+      } catch {}
+    }
     connections.set(userId, ws);
     logger.info({ userId }, "WS connected");
     ws.on("message", (data) => {
@@ -201,8 +207,15 @@ wss.on("connection", (ws, req) => {
       } catch {}
     });
     ws.on("close", () => {
-      connections.delete(userId);
+      if (connections.get(userId) === ws) {
+        connections.delete(userId);
+      }
       logger.info({ userId }, "WS disconnected");
+    });
+    ws.on("error", () => {
+      if (connections.get(userId) === ws) {
+        connections.delete(userId);
+      }
     });
   }
 });
@@ -215,6 +228,10 @@ setWsSendMessage((userId, message) => {
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   logger.info("SIGTERM received, shutting down gracefully");
+  for (const [, ws] of connections) {
+    try { ws.close(1001, "Server shutting down"); } catch {}
+  }
+  connections.clear();
   await closeDb();
   server.close();
   process.exit(0);

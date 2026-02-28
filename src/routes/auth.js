@@ -16,6 +16,7 @@ const OTP_PURPOSES = new Set(["register", "reset_mpin"]);
 const OTP_WINDOW_MS = 10 * 60 * 1000;
 const MPIN_LOCK_WINDOW_MS = 15 * 60 * 1000;
 const MPIN_MAX_FAILURES = 6;
+const MPIN_FAILURE_CACHE_MAX = 20_000;
 const mpinFailures = new Map(); // phone -> { count, lockUntil }
 
 function toE164(phone) {
@@ -86,6 +87,21 @@ function markMpinFailure(phone) {
   const nextCount = current.count + 1;
   const lockUntil = nextCount >= MPIN_MAX_FAILURES ? now + MPIN_LOCK_WINDOW_MS : 0;
   mpinFailures.set(key, { count: nextCount, lockUntil });
+  // Bound in-memory failure cache to avoid unbounded growth under credential-stuffing.
+  if (mpinFailures.size > MPIN_FAILURE_CACHE_MAX) {
+    for (const [k, entry] of mpinFailures) {
+      if (!entry?.lockUntil || entry.lockUntil <= now) {
+        mpinFailures.delete(k);
+      }
+      if (mpinFailures.size <= MPIN_FAILURE_CACHE_MAX) break;
+    }
+    // Hard cap fallback: evict oldest keys if still over the limit.
+    while (mpinFailures.size > MPIN_FAILURE_CACHE_MAX) {
+      const firstKey = mpinFailures.keys().next().value;
+      if (!firstKey) break;
+      mpinFailures.delete(firstKey);
+    }
+  }
 }
 
 function clearMpinFailures(phone) {
